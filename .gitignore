@@ -1,0 +1,20 @@
+# Xcode user and local build state
+DerivedData/
+build/
+.build/
+*.xcuserstate
+xcuserdata/
+
+# Swift package and macOS artifacts
+.swiftpm/
+.DS_Store
+
+# Local test and diagnostic artifacts
+*.log
+*.xcresult
+*.xctestrun
+*.hmap
+
+# Private project documentation
+/Docs/
+/CHANGELOG.md
