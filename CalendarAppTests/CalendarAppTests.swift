@@ -1,4 +1,5 @@
 import Foundation
+import EventKit
 import SwiftData
 import XCTest
 @testable import CalendarApp
@@ -143,22 +144,87 @@ private actor MultiYearHolidayProvider: HolidayProvider {
 private final class MockSystemCalendarService: SystemCalendarServiceProtocol {
     var access: SystemCalendarAccess
     let requestedAccess: SystemCalendarAccess
+    private let changeStream: AsyncStream<SystemCalendarChange>
+    private let changeContinuation: AsyncStream<SystemCalendarChange>.Continuation
     var requestCount = 0
+    var fixtureCalendars: [SystemCalendarDescriptor] = []
     var fixtureEvents: [SystemCalendarEventSnapshot] = []
     var eventError: SystemCalendarServiceError?
+    var lastCalendarIDs: Set<String>?
+    var eventRequestCount = 0
+    var didSubscribeToChanges = false
+    var writeAccessRequestCount = 0
+    var createdEventDrafts: [SystemCalendarEventDraft] = []
+    var createdEventCalendarIDs: [String] = []
 
     init(
         access: SystemCalendarAccess,
         requestedAccess: SystemCalendarAccess
     ) {
+        let changeStream = AsyncStream<SystemCalendarChange>.makeStream()
         self.access = access
         self.requestedAccess = requestedAccess
+        self.changeStream = changeStream.stream
+        self.changeContinuation = changeStream.continuation
     }
 
     func requestReadAccess() async -> SystemCalendarAccess {
         requestCount += 1
         access = requestedAccess
         return access
+    }
+
+    func requestWriteAccess() async -> SystemCalendarAccess {
+        writeAccessRequestCount += 1
+        access = requestedAccess
+        return access
+    }
+
+    func changes() -> AsyncStream<SystemCalendarChange> {
+        didSubscribeToChanges = true
+        return changeStream
+    }
+
+    func emitChange(_ change: SystemCalendarChange = .storeChanged) {
+        changeContinuation.yield(change)
+    }
+
+    func calendars() async throws -> [SystemCalendarDescriptor] {
+        if let eventError {
+            throw eventError
+        }
+        return fixtureCalendars
+    }
+
+    func writableCalendars() async throws -> [SystemCalendarDescriptor] {
+        if let eventError {
+            throw eventError
+        }
+        return fixtureCalendars
+    }
+
+    func createEvent(_ draft: SystemCalendarEventDraft, calendarID: String) async throws {
+        guard fixtureCalendars.contains(where: { $0.identifier == calendarID }) else {
+            throw SystemCalendarWriteError.calendarNotFound
+        }
+        createdEventDrafts.append(draft)
+        createdEventCalendarIDs.append(calendarID)
+        fixtureEvents.append(
+            SystemCalendarEventSnapshot(
+                externalIdentifier: "mock-created-event-\(createdEventDrafts.count)",
+                calendarItemIdentifier: "mock-created-item-\(createdEventDrafts.count)",
+                title: draft.title,
+                startDate: draft.startDate,
+                endDate: draft.endDate,
+                isAllDay: draft.isAllDay,
+                timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+                calendarIdentifier: calendarID,
+                calendarTitle: fixtureCalendars.first { $0.identifier == calendarID }?.title ?? "系统日历",
+                sourceTitle: fixtureCalendars.first { $0.identifier == calendarID }?.sourceTitle,
+                note: draft.note
+            )
+        )
+        changeContinuation.yield(.storeChanged)
     }
 
     func events(
@@ -168,10 +234,39 @@ private final class MockSystemCalendarService: SystemCalendarServiceProtocol {
         guard interval.start <= interval.end else {
             throw SystemCalendarServiceError.invalidDateRange
         }
+        eventRequestCount += 1
+        lastCalendarIDs = calendarIDs
         if let eventError {
             throw eventError
         }
-        return fixtureEvents
+        guard let calendarIDs else {
+            return fixtureEvents
+        }
+        return fixtureEvents.filter { calendarIDs.contains($0.calendarIdentifier) }
+    }
+}
+
+@MainActor
+private final class MockSystemCalendarSelectionStore: SystemCalendarSelectionStoreProtocol {
+    var selectedIDs: Set<String>?
+    var savedIDs: Set<String>?
+    var saveError: SystemCalendarSelectionStoreError?
+
+    init(selectedIDs: Set<String>? = nil) {
+        self.selectedIDs = selectedIDs
+        self.savedIDs = selectedIDs
+    }
+
+    func selectedCalendarIDs() throws -> Set<String>? {
+        selectedIDs
+    }
+
+    func save(selectedCalendarIDs: Set<String>?) throws {
+        if let saveError {
+            throw saveError
+        }
+        selectedIDs = selectedCalendarIDs
+        savedIDs = selectedCalendarIDs
     }
 }
 
@@ -233,6 +328,565 @@ final class CalendarAppTests: XCTestCase {
     }
 
     @MainActor
+    func testEventKitSystemCalendarServicePublishesStoreChanges() async {
+        let eventStore = EKEventStore()
+        let service = EventKitSystemCalendarService(eventStore: eventStore)
+        let stream = service.changes()
+        let changeTask = Task { @MainActor in
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+
+        await Task.yield()
+        NotificationCenter.default.post(
+            name: .EKEventStoreChanged,
+            object: eventStore
+        )
+
+        let change = await changeTask.value
+        XCTAssertEqual(change, .storeChanged)
+        changeTask.cancel()
+    }
+
+    @MainActor
+    func testSystemCalendarEventDraftNormalizesAndValidatesInput() throws {
+        let startDate = try makeShanghaiDate(year: 2026, month: 8, day: 6)
+        let draft = try SystemCalendarEventDraft(
+            title: "  系统会议  ",
+            startDate: startDate,
+            endDate: startDate.addingTimeInterval(60 * 60),
+            note: "  会议室 A  "
+        )
+
+        XCTAssertEqual(draft.title, "系统会议")
+        XCTAssertEqual(draft.note, "会议室 A")
+        XCTAssertThrowsError(
+            try SystemCalendarEventDraft(
+                title: " ",
+                startDate: startDate,
+                endDate: startDate
+            )
+        ) { error in
+            XCTAssertEqual(error as? SystemCalendarEventDraftValidationError, .emptyTitle)
+        }
+    }
+
+    @MainActor
+    func testSystemCalendarEventEditorRequestsWriteAccessOnlyWhenSubmitted() async throws {
+        let service = MockSystemCalendarService(
+            access: .notDetermined,
+            requestedAccess: .writeOnly
+        )
+        service.fixtureCalendars = [
+            SystemCalendarDescriptor(
+                identifier: "default",
+                title: "默认日历",
+                sourceTitle: "本机日历"
+            )
+        ]
+        let model = SystemCalendarEventEditorFeatureModel(service: service)
+
+        await model.load()
+        XCTAssertEqual(model.state, .idle)
+        XCTAssertEqual(service.writeAccessRequestCount, 0)
+
+        await model.requestWriteAccess()
+
+        XCTAssertEqual(model.access, .writeOnly)
+        XCTAssertEqual(model.state, .ready)
+        XCTAssertEqual(service.writeAccessRequestCount, 1)
+        XCTAssertEqual(model.selectedCalendarID, "default")
+    }
+
+    @MainActor
+    func testSystemCalendarEventEditorCreatesExternalEventWithoutLocalSchedule() async throws {
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        service.fixtureCalendars = [
+            SystemCalendarDescriptor(
+                identifier: "work",
+                title: "工作",
+                sourceTitle: "公司账号"
+            )
+        ]
+        let model = SystemCalendarEventEditorFeatureModel(service: service)
+        let startDate = try makeShanghaiDate(year: 2026, month: 8, day: 6)
+
+        await model.load()
+        let didSave = await model.save(
+            title: "项目评审",
+            startDate: startDate.addingTimeInterval(9 * 60 * 60),
+            endDate: startDate.addingTimeInterval(10 * 60 * 60),
+            isAllDay: false,
+            note: "系统事件"
+        )
+
+        XCTAssertTrue(didSave)
+        XCTAssertEqual(service.createdEventDrafts.count, 1)
+        XCTAssertEqual(service.createdEventDrafts.first?.title, "项目评审")
+        XCTAssertEqual(service.createdEventCalendarIDs, ["work"])
+        XCTAssertTrue(service.fixtureEvents.contains { $0.title == "项目评审" })
+    }
+
+    @MainActor
+    func testCalendarNotificationRequestNormalizesAndValidatesInput() throws {
+        let date = try makeShanghaiDate(year: 2026, month: 8, day: 6)
+        let request = try CalendarNotificationRequest(
+            id: "  schedule.project-review  ",
+            kind: .schedule,
+            title: "  项目评审  ",
+            body: "  会议室 A  ",
+            date: date
+        )
+
+        XCTAssertEqual(request.id, "schedule.project-review")
+        XCTAssertEqual(request.title, "项目评审")
+        XCTAssertEqual(request.body, "会议室 A")
+        XCTAssertTrue(CalendarNotificationAuthorization.authorized.canSchedule)
+        XCTAssertFalse(CalendarNotificationAuthorization.denied.canSchedule)
+
+        XCTAssertThrowsError(
+            try CalendarNotificationRequest(
+                id: " ",
+                kind: .specialDay,
+                title: "生日",
+                body: "",
+                date: date
+            )
+        ) { error in
+            XCTAssertEqual(error as? CalendarNotificationRequestValidationError, .emptyIdentifier)
+        }
+    }
+
+    @MainActor
+    func testFixtureNotificationServiceReconcilesPlanAndEmptyPlan() async throws {
+        let service = FixtureNotificationService(authorization: .authorized)
+        let request = try CalendarNotificationRequest(
+            id: "holiday.spring-festival",
+            kind: .holiday,
+            title: "春节假期开始",
+            body: "今天是春节假期第一天",
+            date: try makeShanghaiDate(year: 2026, month: 2, day: 15)
+        )
+
+        try await service.reconcile([request])
+        try await service.reconcile([])
+
+        XCTAssertEqual(service.reconciledPlans, [[request], []])
+    }
+
+    func testCalendarNotificationPlanBuilderUsesStableIDsAndDayPriorityInputs() throws {
+        let referenceDate = try makeShanghaiDate(year: 2026, month: 8, day: 1)
+            .addingTimeInterval(8 * 60 * 60)
+        let timedSchedule = try ScheduleItem(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000001")!,
+            title: "项目评审",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(10 * 60 * 60),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(11 * 60 * 60)
+        )
+        let allDaySchedule = try ScheduleItem(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000002")!,
+            title: "全天事项",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 3),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 3),
+            isAllDay: true
+        )
+        let holidayDay = try XCTUnwrap(DayID(year: 2026, month: 8, day: 4))
+        let makeupDay = try XCTUnwrap(DayID(year: 2026, month: 8, day: 5))
+        let specialDay = try SpecialDay(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000003")!,
+            title: "纪念日",
+            anchorDay: try XCTUnwrap(DayID(year: 2000, month: 8, day: 6)),
+            recurrence: .yearlyGregorian
+        )
+        let preferences = try CalendarNotificationPreferences(
+            enabledKinds: Set(CalendarNotificationKind.allCases),
+            scheduleLeadTimeMinutes: 30,
+            dayTriggerHour: 8,
+            dayTriggerMinute: 0
+        )
+
+        let requests = try CalendarNotificationPlanBuilder().build(
+            schedules: [timedSchedule, allDaySchedule],
+            holidayRecords: [
+                HolidayRecord(dayID: holidayDay, name: "法定节假日", kind: .holiday),
+                HolidayRecord(dayID: makeupDay, name: "调休补班", kind: .makeupWorkday)
+            ],
+            specialDays: [specialDay],
+            preferences: preferences,
+            referenceDate: referenceDate,
+            horizonDays: 10
+        )
+
+        XCTAssertEqual(
+            requests.map(\.id),
+            [
+                "schedule.D0000000-0000-0000-0000-000000000001.2026-08-02",
+                "schedule.D0000000-0000-0000-0000-000000000002.2026-08-03",
+                "holiday.2026-08-04",
+                "makeupWorkday.2026-08-05",
+                "special-day.D0000000-0000-0000-0000-000000000003.2026-08-06"
+            ]
+        )
+        XCTAssertEqual(
+            requests.map(\.kind),
+            [.schedule, .schedule, .holiday, .makeupWorkday, .specialDay]
+        )
+        XCTAssertEqual(
+            requests.map(\.date),
+            [
+                try makeShanghaiDate(year: 2026, month: 8, day: 2).addingTimeInterval(9 * 60 * 60 + 30 * 60),
+                try makeShanghaiDate(year: 2026, month: 8, day: 3).addingTimeInterval(8 * 60 * 60),
+                try makeShanghaiDate(year: 2026, month: 8, day: 4).addingTimeInterval(8 * 60 * 60),
+                try makeShanghaiDate(year: 2026, month: 8, day: 5).addingTimeInterval(8 * 60 * 60),
+                try makeShanghaiDate(year: 2026, month: 8, day: 6).addingTimeInterval(8 * 60 * 60)
+            ]
+        )
+    }
+
+    func testCalendarNotificationPlanBuilderExpandsDailyAndWeeklySchedules() throws {
+        let daily = try ScheduleItem(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000011")!,
+            title: "每日阅读",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(10 * 60 * 60),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(11 * 60 * 60),
+            recurrence: .daily,
+            repeatUntil: try makeShanghaiDate(year: 2026, month: 8, day: 3)
+                .addingTimeInterval(11 * 60 * 60)
+        )
+        let weekly = try ScheduleItem(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000012")!,
+            title: "每周复盘",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(14 * 60 * 60),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(15 * 60 * 60),
+            recurrence: .weekly,
+            repeatUntil: try makeShanghaiDate(year: 2026, month: 8, day: 15)
+                .addingTimeInterval(15 * 60 * 60)
+        )
+        let preferences = try CalendarNotificationPreferences(
+            enabledKinds: [.schedule],
+            scheduleLeadTimeMinutes: 15
+        )
+
+        let requests = try CalendarNotificationPlanBuilder().build(
+            schedules: [daily, weekly],
+            holidayRecords: [],
+            specialDays: [],
+            preferences: preferences,
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(8 * 60 * 60),
+            horizonDays: 10
+        )
+
+        XCTAssertEqual(requests.count, 5)
+        XCTAssertEqual(
+            requests.map(\.id),
+            [
+                "schedule.D0000000-0000-0000-0000-000000000011.2026-08-01",
+                "schedule.D0000000-0000-0000-0000-000000000012.2026-08-01",
+                "schedule.D0000000-0000-0000-0000-000000000011.2026-08-02",
+                "schedule.D0000000-0000-0000-0000-000000000011.2026-08-03",
+                "schedule.D0000000-0000-0000-0000-000000000012.2026-08-08"
+            ]
+        )
+        XCTAssertEqual(
+            requests.first?.date,
+            try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(9 * 60 * 60 + 45 * 60)
+        )
+    }
+
+    func testCalendarNotificationPlanBuilderSkipsDisabledKinds() throws {
+        let schedule = try ScheduleItem(
+            title: "不应发送",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(10 * 60 * 60),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(11 * 60 * 60)
+        )
+        let holiday = HolidayRecord(
+            dayID: try XCTUnwrap(DayID(year: 2026, month: 8, day: 3)),
+            name: "节假日",
+            kind: .holiday
+        )
+
+        let requests = try CalendarNotificationPlanBuilder().build(
+            schedules: [schedule],
+            holidayRecords: [holiday],
+            specialDays: [],
+            preferences: .disabled,
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 1),
+            horizonDays: 10
+        )
+
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    @MainActor
+    func testNotificationPreferencesStoreRoundTripsAndClearsPreferences() throws {
+        let container = try makeModelContainer()
+        let store = SwiftDataNotificationPreferencesStore(modelContext: ModelContext(container))
+        let preferences = try CalendarNotificationPreferences(
+            enabledKinds: [.holiday, .specialDay],
+            scheduleLeadTimeMinutes: 45,
+            dayTriggerHour: 7,
+            dayTriggerMinute: 30
+        )
+
+        try store.save(preferences)
+        XCTAssertEqual(try store.load(), preferences)
+
+        try store.save(nil)
+        XCTAssertNil(try store.load())
+    }
+
+    @MainActor
+    func testSettingsReconcilesEnabledScheduleNotificationPlan() async throws {
+        let container = try makeModelContainer()
+        let context = ModelContext(container)
+        let scheduleRepository = ScheduleRepository(modelContext: context)
+        let notificationPreferencesStore = SwiftDataNotificationPreferencesStore(modelContext: context)
+        let service = FixtureNotificationService(authorization: .authorized)
+        let schedule = try ScheduleItem(
+            id: UUID(uuidString: "D0000000-0000-0000-0000-000000000021")!,
+            title: "计划中的日程",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(10 * 60 * 60),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 2)
+                .addingTimeInterval(11 * 60 * 60)
+        )
+        try scheduleRepository.save(schedule)
+        let model = SettingsFeatureModel(
+            systemCalendarService: nil,
+            notificationService: service,
+            scheduleRepository: scheduleRepository,
+            notificationPreferencesStore: notificationPreferencesStore
+        )
+
+        await model.loadNotificationAuthorization()
+        model.loadNotificationPreferences()
+        model.setNotificationKindEnabled(true, for: .schedule)
+        await model.reconcileNotificationPlan(
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 1)
+                .addingTimeInterval(8 * 60 * 60)
+        )
+
+        XCTAssertEqual(model.notificationPlanState, .ready)
+        XCTAssertEqual(model.notificationPlanCount, 1)
+        XCTAssertEqual(service.reconciledPlans.last?.first?.title, "计划中的日程")
+        XCTAssertEqual(model.notificationPlanSummary, "当前有 1 条待发送提醒")
+        XCTAssertEqual(try notificationPreferencesStore.load()?.enabledKinds, [.schedule])
+    }
+
+    func testCalendarWidgetSnapshotComposerIncludesTodayAndNextDate() throws {
+        let today = try XCTUnwrap(DayID(year: 2026, month: 8, day: 11))
+        let nextDay = try XCTUnwrap(DayID(year: 2026, month: 8, day: 20))
+        let presentation = DayPresentation(
+            dayID: today,
+            workStatus: .holiday,
+            statusSource: .holidayProvider(providerID: "fixture"),
+            statusReason: "官方安排",
+            primaryAnnotation: DayAnnotation(
+                dayID: today,
+                title: "七夕",
+                kind: .importantTraditionalFestival,
+                sourceID: "fixture"
+            ),
+            scheduleCount: 2
+        )
+        let upcoming = UpcomingDateSummary(
+            dayID: nextDay,
+            title: "周末短途旅行",
+            subtitle: "本地日程",
+            kind: nil,
+            scheduleCount: 1
+        )
+
+        let snapshot = CalendarWidgetSnapshotComposer().makeSnapshot(
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 11)
+                .addingTimeInterval(8 * 60 * 60),
+            presentation: presentation,
+            upcomingDates: [
+                UpcomingDateSummary(
+                    dayID: today,
+                    title: "七夕",
+                    subtitle: "传统节日",
+                    kind: .importantTraditionalFestival,
+                    scheduleCount: 0
+                ),
+                upcoming
+            ]
+        )
+
+        XCTAssertEqual(snapshot.dayID, "2026-08-11")
+        XCTAssertEqual(snapshot.dateLabel, "8月11日 周二")
+        XCTAssertEqual(snapshot.statusKey, "holiday")
+        XCTAssertEqual(snapshot.statusLabel, "休息日")
+        XCTAssertEqual(snapshot.primaryTitle, "七夕")
+        XCTAssertEqual(snapshot.scheduleCount, 2)
+        XCTAssertEqual(snapshot.nextDate?.dayID, "2026-08-20")
+        XCTAssertEqual(snapshot.nextDate?.title, "周末短途旅行")
+    }
+
+    func testCalendarWidgetSnapshotComposerUsesDayIDAcrossMidnight() throws {
+        let beforeMidnight = try XCTUnwrap(DayID(year: 2026, month: 8, day: 11))
+        let afterMidnight = try XCTUnwrap(DayID(year: 2026, month: 8, day: 12))
+        let composer = CalendarWidgetSnapshotComposer()
+
+        let beforeSnapshot = composer.makeSnapshot(
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 11)
+                .addingTimeInterval(23 * 60 * 60 + 59 * 60),
+            presentation: DayPresentation(
+                dayID: beforeMidnight,
+                workStatus: .workday,
+                statusSource: .defaultWeekRule
+            ),
+            upcomingDates: []
+        )
+        let afterSnapshot = composer.makeSnapshot(
+            referenceDate: try makeShanghaiDate(year: 2026, month: 8, day: 12),
+            presentation: DayPresentation(
+                dayID: afterMidnight,
+                workStatus: .workday,
+                statusSource: .defaultWeekRule
+            ),
+            upcomingDates: []
+        )
+
+        XCTAssertEqual(beforeSnapshot.dayID, "2026-08-11")
+        XCTAssertEqual(beforeSnapshot.dateLabel, "8月11日 周二")
+        XCTAssertEqual(afterSnapshot.dayID, "2026-08-12")
+        XCTAssertEqual(afterSnapshot.dateLabel, "8月12日 周三")
+        XCTAssertNotEqual(beforeSnapshot.dayID, afterSnapshot.dayID)
+    }
+
+    func testCalendarWidgetTimelinePolicyUsesReferenceTimeZoneAcrossMidnight() throws {
+        let policy = CalendarWidgetTimelinePolicy()
+        let beforeMidnight = try makeShanghaiDate(year: 2026, month: 8, day: 11)
+            .addingTimeInterval(23 * 60 * 60 + 30 * 60)
+        var hostCalendar = Calendar(identifier: .gregorian)
+        hostCalendar.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let afterMidnight = policy.nextRefresh(
+            after: beforeMidnight,
+            calendar: hostCalendar
+        )
+
+        XCTAssertEqual(afterMidnight.timeIntervalSince(beforeMidnight), 60 * 60, accuracy: 0.001)
+        XCTAssertEqual(DayID(afterMidnight).description, "2026-08-12")
+    }
+
+    func testCalendarWidgetSnapshotStoreRoundTripsAndRejectsInvalidData() throws {
+        let suiteName = "CalendarAppTests.widget." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let store = CalendarWidgetSnapshotStore(defaults: defaults)
+        let snapshot = CalendarWidgetSnapshot(
+            generatedAt: Date(timeIntervalSince1970: 100),
+            dayID: "2026-08-11",
+            dateLabel: "8月11日 周二",
+            statusKey: "workday",
+            statusLabel: "工作日",
+            primaryTitle: "项目评审",
+            scheduleCount: 1
+        )
+
+        XCTAssertNil(try store.load())
+        try store.save(snapshot)
+        XCTAssertEqual(try store.load(), snapshot)
+
+        defaults.set(Data("invalid".utf8), forKey: CalendarWidgetSnapshotStore.snapshotKey)
+        XCTAssertThrowsError(try store.load()) { error in
+            XCTAssertEqual(
+                error as? CalendarWidgetSnapshotStoreError,
+                .decodingFailed
+            )
+        }
+
+        let incompatibleSnapshot = CalendarWidgetSnapshot(
+            generatedAt: snapshot.generatedAt,
+            dayID: snapshot.dayID,
+            dateLabel: snapshot.dateLabel,
+            statusKey: snapshot.statusKey,
+            statusLabel: snapshot.statusLabel,
+            schemaVersion: CalendarWidgetSnapshot.schemaVersion + 1
+        )
+        defaults.set(
+            try JSONEncoder().encode(incompatibleSnapshot),
+            forKey: CalendarWidgetSnapshotStore.snapshotKey
+        )
+        XCTAssertThrowsError(try store.load()) { error in
+            XCTAssertEqual(
+                error as? CalendarWidgetSnapshotStoreError,
+                .decodingFailed
+            )
+        }
+
+        store.remove()
+        XCTAssertNil(try store.load())
+    }
+
+    @MainActor
+    func testSettingsFeatureRequestsNotificationAuthorizationOnUserAction() async throws {
+        let service = FixtureNotificationService()
+        let model = SettingsFeatureModel(
+            systemCalendarService: nil,
+            notificationService: service
+        )
+
+        await model.loadNotificationAuthorization()
+        XCTAssertEqual(model.notificationAuthorization, .notDetermined)
+        XCTAssertEqual(service.authorizationRequestCount, 0)
+
+        await model.requestNotificationAuthorization()
+
+        XCTAssertEqual(model.notificationAuthorization, .authorized)
+        XCTAssertEqual(model.notificationState, .ready)
+        XCTAssertEqual(service.authorizationRequestCount, 1)
+
+        let request = try CalendarNotificationRequest(
+            id: "special-day.birthday",
+            kind: .specialDay,
+            title: "生日",
+            body: "今天是生日",
+            date: try makeShanghaiDate(year: 2026, month: 10, day: 18)
+        )
+        await model.reconcileNotifications([request])
+        XCTAssertEqual(service.reconciledPlans, [[request]])
+    }
+
+    @MainActor
+    func testSettingsDoesNotScheduleNotificationsWithoutPermission() async throws {
+        let service = FixtureNotificationService(authorization: .denied)
+        let model = SettingsFeatureModel(
+            systemCalendarService: nil,
+            notificationService: service
+        )
+        let request = try CalendarNotificationRequest(
+            id: "makeup-workday.2026-02-14",
+            kind: .makeupWorkday,
+            title: "调休补班",
+            body: "今天按工作日安排",
+            date: try makeShanghaiDate(year: 2026, month: 2, day: 14)
+        )
+
+        await model.loadNotificationAuthorization()
+        await model.reconcileNotifications([request])
+
+        XCTAssertTrue(service.reconciledPlans.isEmpty)
+        XCTAssertEqual(model.notificationErrorMessage, "没有通知权限")
+    }
+
+    @MainActor
     func testSettingsFeatureRequestsReadAccessWithoutWritingLocalSchedules() async {
         let service = MockSystemCalendarService(
             access: .notDetermined,
@@ -246,6 +900,104 @@ final class CalendarAppTests: XCTestCase {
         XCTAssertEqual(model.systemCalendarAccess, .fullAccess)
         XCTAssertEqual(model.systemCalendarState, .ready)
         XCTAssertEqual(service.requestCount, 1)
+    }
+
+    @MainActor
+    func testSettingsLoadsAndPersistsSelectedSystemCalendarSources() async {
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        service.fixtureCalendars = [
+            SystemCalendarDescriptor(
+                identifier: "work",
+                title: "工作",
+                sourceTitle: "公司账号"
+            ),
+            SystemCalendarDescriptor(
+                identifier: "personal",
+                title: "个人",
+                sourceTitle: "iCloud"
+            )
+        ]
+        let store = MockSystemCalendarSelectionStore(selectedIDs: ["work"])
+        let model = SettingsFeatureModel(
+            systemCalendarService: service,
+            systemCalendarSelectionStore: store
+        )
+
+        await model.loadSystemCalendarConfiguration()
+
+        XCTAssertEqual(model.systemCalendarState, .ready)
+        XCTAssertEqual(model.selectedSystemCalendarIDs, ["work"])
+        XCTAssertTrue(model.isSystemCalendarSelected("work"))
+        XCTAssertFalse(model.isSystemCalendarSelected("personal"))
+        XCTAssertEqual(model.systemCalendarSelectionSummary, "已选择 1 个日历来源")
+
+        model.setSystemCalendarSelected(true, for: "personal")
+
+        XCTAssertEqual(store.savedIDs, ["personal", "work"])
+        XCTAssertEqual(model.systemCalendarSelectionSummary, "显示全部 2 个日历")
+    }
+
+    @MainActor
+    func testSettingsRereadsSystemCalendarAccessAfterChange() async {
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        service.fixtureCalendars = [
+            SystemCalendarDescriptor(
+                identifier: "work",
+                title: "工作",
+                sourceTitle: "公司账号"
+            )
+        ]
+        let model = SettingsFeatureModel(systemCalendarService: service)
+
+        await model.loadSystemCalendarConfiguration()
+        XCTAssertEqual(model.systemCalendarCalendars.count, 1)
+
+        let observationTask = Task { @MainActor in
+            await model.observeSystemCalendarChanges()
+        }
+        for _ in 0..<20 {
+            if service.didSubscribeToChanges {
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(service.didSubscribeToChanges)
+        service.access = .denied
+        service.fixtureCalendars = []
+        service.emitChange()
+
+        for _ in 0..<100 {
+            if model.systemCalendarAccess == .denied {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(model.systemCalendarAccess, .denied)
+        XCTAssertEqual(model.systemCalendarState, .ready)
+        XCTAssertTrue(model.systemCalendarCalendars.isEmpty)
+        XCTAssertFalse(model.isSystemCalendarSelectionConfigured)
+
+        observationTask.cancel()
+    }
+
+    @MainActor
+    func testSystemCalendarSelectionStoreRoundTripsEmptySelection() throws {
+        let container = try makeModelContainer()
+        let context = ModelContext(container)
+        let store = SwiftDataSystemCalendarSelectionStore(modelContext: context)
+
+        XCTAssertNil(try store.selectedCalendarIDs())
+        try store.save(selectedCalendarIDs: [])
+        XCTAssertEqual(try store.selectedCalendarIDs(), [])
+        try store.save(selectedCalendarIDs: nil)
+        XCTAssertNil(try store.selectedCalendarIDs())
     }
 
     func testSystemCalendarEventSnapshotUsesExternalIdentifierAndOccurrenceStartForIdentity() throws {
@@ -755,6 +1507,69 @@ final class CalendarAppTests: XCTestCase {
         XCTAssertNotNil(components.queryItems?.first(where: { $0.name == "name" })?.value)
     }
 
+    func testSolarTermsAlgorithmProviderDerives2026TermsWithoutAnnualTable() async throws {
+        let provider = SolarTermsAlgorithmProvider(
+            now: { Date(timeIntervalSince1970: 300) }
+        )
+        let snapshot = try await provider.fetchYear(2026)
+
+        XCTAssertEqual(snapshot.providerID, "solar-terms-local-algorithm-v1")
+        XCTAssertEqual(snapshot.annotations.count, 24)
+        XCTAssertEqual(
+            snapshot.annotations.first(where: { $0.title == "小寒" })?.dayID.description,
+            "2026-01-05"
+        )
+        XCTAssertEqual(
+            snapshot.annotations.first(where: { $0.title == "立秋" })?.dayID.description,
+            "2026-08-07"
+        )
+    }
+
+    func testChineseTraditionalFestivalProviderConvertsLunarDates() async throws {
+        let provider = ChineseTraditionalFestivalProvider(
+            now: { Date(timeIntervalSince1970: 300) }
+        )
+        let snapshot = try await provider.fetchYear(2026)
+
+        XCTAssertEqual(snapshot.providerID, "traditional-festivals-chinese-calendar-v1")
+        XCTAssertEqual(
+            snapshot.annotations.first(where: { $0.title == "春节" })?.dayID.description,
+            "2026-02-17"
+        )
+        XCTAssertEqual(
+            snapshot.annotations.first(where: { $0.title == "中秋节" })?.dayID.description,
+            "2026-09-25"
+        )
+    }
+
+    func testCompositeDateKnowledgeProviderKeepsSuccessfulSources() async throws {
+        let solar = SolarTermsAlgorithmProvider()
+        let traditional = ChineseTraditionalFestivalProvider()
+        let provider = CompositeDateKnowledgeProvider(providers: [traditional, solar])
+
+        let snapshot = try await provider.fetchYear(2026)
+
+        XCTAssertEqual(snapshot.providerID, "date-knowledge-composite-v3-fallback")
+        XCTAssertNotNil(snapshot.annotations.first(where: { $0.title == "小寒" }))
+        XCTAssertNotNil(snapshot.annotations.first(where: { $0.title == "春节" }))
+    }
+
+    func testSolarTermsResilientProviderUsesLocalAlgorithmAfterRemoteFailure() async throws {
+        let remote = RecordingDateKnowledgeProvider(
+            id: "remote",
+            outcome: .failure(.notAvailable)
+        )
+        let provider = SolarTermsResilientProvider(
+            primary: remote,
+            fallback: SolarTermsAlgorithmProvider()
+        )
+
+        let snapshot = try await provider.fetchYear(2026)
+
+        XCTAssertEqual(snapshot.providerID, "solar-terms-local-algorithm-v1")
+        XCTAssertNotNil(snapshot.annotations.first(where: { $0.title == "立秋" }))
+    }
+
     @MainActor
     func testDateKnowledgeRepositoryReturnsFreshCacheAndFallsBackToStaleCache() async throws {
         let dayID = try XCTUnwrap(DayID(year: 2026, month: 1, day: 5))
@@ -1015,6 +1830,199 @@ final class CalendarAppTests: XCTestCase {
         XCTAssertEqual(model.systemCalendarAccess, .fullAccess)
         XCTAssertEqual(model.systemCalendarEvents, [event])
         XCTAssertEqual(model.systemCalendarEvents.first?.sourceTitle, "公司账号")
+    }
+
+    @MainActor
+    func testDayDetailFeatureModelRefreshesEventsAfterSystemCalendarChange() async throws {
+        let dayID = try XCTUnwrap(DayID(year: 2026, month: 8, day: 6))
+        let startDate = try makeShanghaiDate(year: 2026, month: 8, day: 6)
+            .addingTimeInterval(9 * 60 * 60)
+        let firstEvent = SystemCalendarEventSnapshot(
+            externalIdentifier: "recurring-event",
+            calendarItemIdentifier: "recurring-item",
+            title: "每周例会",
+            startDate: startDate,
+            endDate: startDate.addingTimeInterval(60 * 60),
+            isAllDay: false,
+            timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+            calendarIdentifier: "work-calendar",
+            calendarTitle: "工作",
+            recurrenceDescription: "每周"
+        )
+        let updatedEvent = SystemCalendarEventSnapshot(
+            externalIdentifier: "updated-event",
+            calendarItemIdentifier: "updated-item",
+            title: "已更新的例会",
+            startDate: startDate.addingTimeInterval(30 * 60),
+            endDate: startDate.addingTimeInterval(90 * 60),
+            isAllDay: false,
+            timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+            calendarIdentifier: "work-calendar",
+            calendarTitle: "工作",
+            recurrenceDescription: "每两周"
+        )
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        service.fixtureEvents = [firstEvent]
+        let model = DayDetailFeatureModel(
+            dayID: dayID,
+            repository: nil,
+            systemCalendarService: service
+        )
+
+        await model.load()
+        XCTAssertEqual(service.eventRequestCount, 1)
+
+        let observationTask = Task { @MainActor in
+            await model.observeSystemCalendarChanges()
+        }
+        for _ in 0..<20 {
+            if service.didSubscribeToChanges {
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(service.didSubscribeToChanges)
+        service.fixtureEvents = [updatedEvent]
+        service.emitChange()
+
+        for _ in 0..<100 {
+            if service.eventRequestCount == 2 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(service.eventRequestCount, 2)
+        XCTAssertEqual(model.systemCalendarState, .loaded)
+        XCTAssertEqual(model.systemCalendarEvents, [updatedEvent])
+        XCTAssertEqual(model.systemCalendarEvents.first?.recurrenceDescription, "每两周")
+
+        observationTask.cancel()
+    }
+
+    @MainActor
+    func testDayDetailFeatureModelRereadsPermissionAfterSystemCalendarChange() async throws {
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        let event = SystemCalendarEventSnapshot(
+            externalIdentifier: "event",
+            calendarItemIdentifier: "item",
+            title: "待撤销权限的事件",
+            startDate: try makeShanghaiDate(year: 2026, month: 8, day: 6),
+            endDate: try makeShanghaiDate(year: 2026, month: 8, day: 6).addingTimeInterval(60 * 60),
+            isAllDay: false,
+            timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+            calendarIdentifier: "work-calendar",
+            calendarTitle: "工作"
+        )
+        service.fixtureEvents = [event]
+        let model = DayDetailFeatureModel(
+            dayID: try XCTUnwrap(DayID(year: 2026, month: 8, day: 6)),
+            repository: nil,
+            systemCalendarService: service
+        )
+
+        await model.load()
+        XCTAssertEqual(model.systemCalendarState, .loaded)
+
+        let observationTask = Task { @MainActor in
+            await model.observeSystemCalendarChanges()
+        }
+        for _ in 0..<20 {
+            if service.didSubscribeToChanges {
+                break
+            }
+            await Task.yield()
+        }
+        XCTAssertTrue(service.didSubscribeToChanges)
+        service.access = .denied
+        service.emitChange()
+
+        for _ in 0..<100 {
+            if model.systemCalendarAccess == .denied {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(model.systemCalendarAccess, .denied)
+        XCTAssertEqual(model.systemCalendarState, .accessDenied)
+        XCTAssertTrue(model.systemCalendarEvents.isEmpty)
+
+        observationTask.cancel()
+    }
+
+    @MainActor
+    func testDayDetailFeatureModelFiltersSystemCalendarEventsBySelectedSource() async throws {
+        let dayID = try XCTUnwrap(DayID(year: 2026, month: 8, day: 6))
+        let startDate = try makeShanghaiDate(year: 2026, month: 8, day: 6)
+            .addingTimeInterval(9 * 60 * 60)
+        let workEvent = SystemCalendarEventSnapshot(
+            externalIdentifier: "work-event",
+            calendarItemIdentifier: "work-item",
+            title: "工作会议",
+            startDate: startDate,
+            endDate: startDate.addingTimeInterval(60 * 60),
+            isAllDay: false,
+            timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+            calendarIdentifier: "work-calendar",
+            calendarTitle: "工作"
+        )
+        let personalEvent = SystemCalendarEventSnapshot(
+            externalIdentifier: "personal-event",
+            calendarItemIdentifier: "personal-item",
+            title: "个人安排",
+            startDate: startDate.addingTimeInterval(60 * 60),
+            endDate: startDate.addingTimeInterval(2 * 60 * 60),
+            isAllDay: false,
+            timeZoneIdentifier: DayID.defaultTimeZoneIdentifier,
+            calendarIdentifier: "personal-calendar",
+            calendarTitle: "个人"
+        )
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        service.fixtureEvents = [workEvent, personalEvent]
+        let store = MockSystemCalendarSelectionStore(selectedIDs: ["work-calendar"])
+        let model = DayDetailFeatureModel(
+            dayID: dayID,
+            repository: nil,
+            systemCalendarService: service,
+            systemCalendarSelectionStore: store
+        )
+
+        await model.load()
+
+        XCTAssertEqual(service.lastCalendarIDs, ["work-calendar"])
+        XCTAssertEqual(model.systemCalendarEvents, [workEvent])
+        XCTAssertEqual(model.selectedSystemCalendarIDs, ["work-calendar"])
+    }
+
+    @MainActor
+    func testDayDetailFeatureModelShowsFilteredOutStateWhenNoSystemCalendarSourceIsSelected() async throws {
+        let service = MockSystemCalendarService(
+            access: .fullAccess,
+            requestedAccess: .fullAccess
+        )
+        let store = MockSystemCalendarSelectionStore(selectedIDs: [])
+        let model = DayDetailFeatureModel(
+            dayID: try XCTUnwrap(DayID(year: 2026, month: 8, day: 6)),
+            repository: nil,
+            systemCalendarService: service,
+            systemCalendarSelectionStore: store
+        )
+
+        await model.load()
+
+        XCTAssertEqual(model.systemCalendarState, .filteredOut)
+        XCTAssertTrue(model.systemCalendarEvents.isEmpty)
+        XCTAssertNil(service.lastCalendarIDs)
     }
 
     @MainActor
@@ -1672,7 +2680,9 @@ final class CalendarAppTests: XCTestCase {
         let model = HolidaySnapshotModel(snapshot: snapshot, cachedAt: cachedAt)
 
         context.insert(model)
-        model.records.forEach { context.insert($0) }
+        let records = model.makeRecordModels(from: snapshot)
+        records.forEach { context.insert($0) }
+        model.replaceRecords(with: records)
         try context.save()
 
         let stored = try XCTUnwrap(context.fetch(FetchDescriptor<HolidaySnapshotModel>()).first)

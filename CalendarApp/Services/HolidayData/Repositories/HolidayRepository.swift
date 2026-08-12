@@ -183,13 +183,18 @@ final class HolidayRepository: HolidayRepositoryProtocol {
             if let existing = try modelContext.fetch(FetchDescriptor<HolidaySnapshotModel>())
                 .first(where: { $0.year == snapshot.year }) {
                 let oldRecords = existing.records
+                existing.replaceRecords(with: [])
                 oldRecords.forEach(modelContext.delete)
                 existing.replace(with: snapshot, cachedAt: timestamp)
-                existing.records.forEach(modelContext.insert)
+                let newRecords = existing.makeRecordModels(from: snapshot)
+                newRecords.forEach(modelContext.insert)
+                existing.replaceRecords(with: newRecords)
             } else {
                 let model = HolidaySnapshotModel(snapshot: snapshot, cachedAt: timestamp)
                 modelContext.insert(model)
-                model.records.forEach(modelContext.insert)
+                let newRecords = model.makeRecordModels(from: snapshot)
+                newRecords.forEach(modelContext.insert)
+                model.replaceRecords(with: newRecords)
             }
 
             try modelContext.save()

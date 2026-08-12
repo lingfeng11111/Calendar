@@ -22,7 +22,43 @@ struct CalendarApp: App {
             let context = ModelContext(container)
             let vacationRepository = VacationRepository(modelContext: context)
             let scheduleRepository = ScheduleRepository(modelContext: context)
+            let systemCalendarSelectionStore = SwiftDataSystemCalendarSelectionStore(modelContext: context)
+            let notificationPreferencesStore = SwiftDataNotificationPreferencesStore(modelContext: context)
+            let holidayRepository = HolidayRepository(
+                modelContext: context,
+                primaryProvider: HolidayCNProvider(),
+                backupProvider: AILCCHolidayProvider()
+            )
+            let dateKnowledgeRepository = DateKnowledgeRepository(
+                modelContext: context,
+                primaryProvider: CompositeDateKnowledgeProvider(
+                    providers: [
+                        ChineseTraditionalFestivalProvider(),
+                        SolarTermsResilientProvider()
+                    ]
+                ),
+                fallbackProvider: SolarTermsAlgorithmProvider()
+            )
+            let widgetSnapshotCoordinator = WidgetSnapshotCoordinator(
+                holidayRepository: holidayRepository,
+                vacationRepository: vacationRepository,
+                scheduleRepository: scheduleRepository,
+                dateKnowledgeRepository: dateKnowledgeRepository
+            )
+            let systemCalendarService: any SystemCalendarServiceProtocol =
+                ProcessInfo.processInfo.arguments.contains("-ui-testing-system-calendar")
+                    ? FixtureSystemCalendarService()
+                    : EventKitSystemCalendarService()
+            let notificationService: any NotificationServiceProtocol =
+                ProcessInfo.processInfo.arguments.contains("-ui-testing-fixture")
+                    ? FixtureNotificationService()
+                    : UserNotificationsService()
+
+            if ProcessInfo.processInfo.arguments.contains("-ui-testing-system-calendar") {
+                try? systemCalendarSelectionStore.save(selectedCalendarIDs: nil)
+            }
             if ProcessInfo.processInfo.arguments.contains("-ui-testing-fixture") {
+                try? notificationPreferencesStore.save(nil)
                 try? vacationRepository.resetForTesting()
                 try? vacationRepository.seedIfEmpty(with: PersonalDateFixtures.sample)
                 try? scheduleRepository.resetForTesting()
@@ -30,18 +66,15 @@ struct CalendarApp: App {
             }
             _dependencies = State(
                 initialValue: AppDependencies(
-                    holidayRepository: HolidayRepository(
-                        modelContext: context,
-                        primaryProvider: HolidayCNProvider(),
-                        backupProvider: AILCCHolidayProvider()
-                    ),
+                    holidayRepository: holidayRepository,
                     vacationRepository: vacationRepository,
                     scheduleRepository: scheduleRepository,
-                    dateKnowledgeRepository: DateKnowledgeRepository(
-                        modelContext: context,
-                        primaryProvider: SolarTermsDateKnowledgeProvider()
-                    ),
-                    systemCalendarService: EventKitSystemCalendarService()
+                    dateKnowledgeRepository: dateKnowledgeRepository,
+                    systemCalendarService: systemCalendarService,
+                    systemCalendarSelectionStore: systemCalendarSelectionStore,
+                    notificationService: notificationService,
+                    notificationPreferencesStore: notificationPreferencesStore,
+                    widgetSnapshotCoordinator: widgetSnapshotCoordinator
                 )
             )
         } catch {

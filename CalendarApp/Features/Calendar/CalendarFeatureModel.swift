@@ -60,6 +60,7 @@ final class CalendarFeatureModel {
     var monthOverview: MonthOverview
     var upcomingDates: [UpcomingDateSummary] = []
     var dateKnowledgeSnapshot: DateKnowledgeYearSnapshot?
+    var dateKnowledgeState: DateKnowledgeLoadState = .idle
     var errorMessage: String?
 
     init(
@@ -104,13 +105,34 @@ final class CalendarFeatureModel {
         }
 
         displayedMonth = month
-        selectedDayID = nil
-        dataState = .idle
-        presentations = [:]
-        dateKnowledgeSnapshot = nil
-        monthOverview = .empty(for: displayedMonth)
-        upcomingDates = []
-        errorMessage = nil
+        resetDisplayedMonthState()
+    }
+
+    func moveYear(by value: Int) {
+        guard let month = displayedMonth.adding(months: value * 12) else {
+            return
+        }
+
+        displayedMonth = month
+        resetDisplayedMonthState()
+    }
+
+    func jump(to month: CalendarMonth) {
+        guard month != displayedMonth else {
+            return
+        }
+
+        displayedMonth = month
+        resetDisplayedMonthState()
+    }
+
+    /// Returns true when this tap repeats the current selection and should
+    /// therefore be treated as an explicit request for the detail screen.
+    @discardableResult
+    func select(dayID: DayID) -> Bool {
+        let repeatsSelection = selectedDayID == dayID
+        selectedDayID = dayID
+        return repeatsSelection
     }
 
     func goToToday() {
@@ -123,6 +145,7 @@ final class CalendarFeatureModel {
         dataState = .idle
         presentations = [:]
         dateKnowledgeSnapshot = nil
+        dateKnowledgeState = .idle
         monthOverview = .empty(for: displayedMonth)
         upcomingDates = []
         errorMessage = nil
@@ -331,10 +354,29 @@ final class CalendarFeatureModel {
 
     private func dateKnowledgeSnapshot(for year: Int) async -> DateKnowledgeYearSnapshot? {
         guard let dateKnowledgeRepository else {
+            dateKnowledgeState = repository == nil ? .available : .unavailable
             return repository == nil ? previewKnowledgeState(for: year) : nil
         }
 
-        return try? await dateKnowledgeRepository.snapshot(for: year)
+        do {
+            let snapshot = try await dateKnowledgeRepository.snapshot(for: year)
+            dateKnowledgeState = dateKnowledgeRepository.lastLoadState
+            return snapshot
+        } catch {
+            dateKnowledgeState = dateKnowledgeRepository.lastLoadState
+            return nil
+        }
+    }
+
+    private func resetDisplayedMonthState() {
+        selectedDayID = nil
+        dataState = .idle
+        presentations = [:]
+        dateKnowledgeSnapshot = nil
+        dateKnowledgeState = .idle
+        monthOverview = .empty(for: displayedMonth)
+        upcomingDates = []
+        errorMessage = nil
     }
 
     private func makeMonthOverview(

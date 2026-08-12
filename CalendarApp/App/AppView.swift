@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 struct AppView: View {
     @Environment(AppDependencies.self) private var dependencies
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab: AppTab = .calendar
     @State private var calendarRouter = AppRouter()
     @State private var vacationRouter = AppRouter()
@@ -40,7 +41,15 @@ struct AppView: View {
                 .accessibilityIdentifier("tab.vacation")
 
             tabRoot(
-                SettingsScreen(systemCalendarService: dependencies.systemCalendarService),
+                SettingsScreen(
+                    systemCalendarService: dependencies.systemCalendarService,
+                    systemCalendarSelectionStore: dependencies.systemCalendarSelectionStore,
+                    notificationService: dependencies.notificationService,
+                    holidayRepository: dependencies.holidayRepository,
+                    vacationRepository: dependencies.vacationRepository,
+                    scheduleRepository: dependencies.scheduleRepository,
+                    notificationPreferencesStore: dependencies.notificationPreferencesStore
+                ),
                 router: settingsRouter
             )
                 .tabItem { AppTab.settings.label }
@@ -48,6 +57,17 @@ struct AppView: View {
                 .accessibilityIdentifier("tab.settings")
         }
         .tint(dependencies.theme.tint)
+        .task {
+            await dependencies.widgetSnapshotCoordinator?.refresh()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            guard newPhase == .active else {
+                return
+            }
+            Task {
+                await dependencies.widgetSnapshotCoordinator?.refresh()
+            }
+        }
     }
 
     private func tabRoot<Content: View>(_ content: Content, router: AppRouter) -> some View {
@@ -81,10 +101,19 @@ struct AppView: View {
                 vacationRepository: dependencies.vacationRepository,
                 scheduleRepository: dependencies.scheduleRepository,
                 dateKnowledgeRepository: dependencies.dateKnowledgeRepository,
-                systemCalendarService: dependencies.systemCalendarService
+                systemCalendarService: dependencies.systemCalendarService,
+                systemCalendarSelectionStore: dependencies.systemCalendarSelectionStore
             )
         case .settings:
-            SettingsScreen(systemCalendarService: dependencies.systemCalendarService)
+            SettingsScreen(
+                systemCalendarService: dependencies.systemCalendarService,
+                systemCalendarSelectionStore: dependencies.systemCalendarSelectionStore,
+                notificationService: dependencies.notificationService,
+                holidayRepository: dependencies.holidayRepository,
+                vacationRepository: dependencies.vacationRepository,
+                scheduleRepository: dependencies.scheduleRepository,
+                notificationPreferencesStore: dependencies.notificationPreferencesStore
+            )
         }
     }
 }

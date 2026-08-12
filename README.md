@@ -13,7 +13,7 @@ A personal iOS calendar focused on Chinese holidays, makeup workdays, solar term
 
 ## Requirements
 
-- iOS 18 or later
+- iOS 17 or later
 - Xcode 26 or later
 
 ## Build

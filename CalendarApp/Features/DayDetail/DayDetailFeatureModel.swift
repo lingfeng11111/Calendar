@@ -15,6 +15,7 @@ enum DayDetailSystemCalendarState: Equatable, Sendable {
     case idle
     case loading
     case loaded
+    case filteredOut
     case permissionRequired
     case accessDenied
     case accessRestricted
@@ -30,6 +31,7 @@ final class DayDetailFeatureModel {
     @ObservationIgnored let scheduleRepository: (any ScheduleRepositoryProtocol)?
     @ObservationIgnored let dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)?
     @ObservationIgnored let systemCalendarService: (any SystemCalendarServiceProtocol)?
+    @ObservationIgnored let systemCalendarSelectionStore: (any SystemCalendarSelectionStoreProtocol)?
     @ObservationIgnored private let compositionService: DayCompositionService
 
     let dayID: DayID
@@ -45,6 +47,7 @@ final class DayDetailFeatureModel {
     var systemCalendarAccess: SystemCalendarAccess
     var systemCalendarState: DayDetailSystemCalendarState
     var systemCalendarEvents: [SystemCalendarEventSnapshot] = []
+    var selectedSystemCalendarIDs: Set<String>?
     var systemCalendarErrorMessage: String?
 
     init(
@@ -54,6 +57,7 @@ final class DayDetailFeatureModel {
         scheduleRepository: (any ScheduleRepositoryProtocol)? = nil,
         dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)? = nil,
         systemCalendarService: (any SystemCalendarServiceProtocol)? = nil,
+        systemCalendarSelectionStore: (any SystemCalendarSelectionStoreProtocol)? = nil,
         compositionService: DayCompositionService = DayCompositionService()
     ) {
         self.dayID = dayID
@@ -62,9 +66,11 @@ final class DayDetailFeatureModel {
         self.scheduleRepository = scheduleRepository
         self.dateKnowledgeRepository = dateKnowledgeRepository
         self.systemCalendarService = systemCalendarService
+        self.systemCalendarSelectionStore = systemCalendarSelectionStore
         self.compositionService = compositionService
         self.systemCalendarAccess = systemCalendarService?.access ?? .unavailable
         self.systemCalendarState = systemCalendarService == nil ? .unavailable : .idle
+        self.selectedSystemCalendarIDs = nil
         self.presentation = compositionService.compose(
             dayID: dayID,
             holidayState: .unavailable
@@ -241,6 +247,19 @@ final class DayDetailFeatureModel {
             return
         }
 
+        do {
+            selectedSystemCalendarIDs = try systemCalendarSelectionStore?.selectedCalendarIDs()
+        } catch {
+            selectedSystemCalendarIDs = nil
+            systemCalendarErrorMessage = "系统日历来源设置读取失败，暂显示全部来源"
+        }
+
+        if selectedSystemCalendarIDs?.isEmpty == true {
+            systemCalendarEvents = []
+            systemCalendarState = .filteredOut
+            return
+        }
+
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = DayID.defaultTimeZone
         guard let startDate = dayID.date,
@@ -260,7 +279,7 @@ final class DayDetailFeatureModel {
         do {
             systemCalendarEvents = try await systemCalendarService.events(
                 in: DateInterval(start: startDate, end: endDate),
-                calendarIDs: nil
+                calendarIDs: selectedSystemCalendarIDs
             )
             systemCalendarState = .loaded
         } catch is CancellationError {
@@ -275,6 +294,19 @@ final class DayDetailFeatureModel {
             systemCalendarEvents = []
             systemCalendarErrorMessage = "系统日历读取失败"
             systemCalendarState = .failed
+        }
+    }
+
+    func observeSystemCalendarChanges() async {
+        guard let systemCalendarService else {
+            return
+        }
+
+        for await _ in systemCalendarService.changes() {
+            guard !Task.isCancelled else {
+                return
+            }
+            await loadSystemCalendarEvents()
         }
     }
 

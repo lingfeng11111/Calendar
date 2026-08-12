@@ -167,9 +167,38 @@ protocol DateKnowledgeProvider: Sendable {
     func fetchYear(_ year: Int) async throws -> DateKnowledgeYearSnapshot
 }
 
+enum DateKnowledgeLoadState: Equatable, Sendable {
+    case idle
+    case loading
+    case available
+    case usingFallback
+    case usingCache
+    case unavailable
+
+    var displayText: String? {
+        switch self {
+        case .idle, .available:
+            nil
+        case .loading:
+            "正在读取节气与节日数据"
+        case .usingFallback:
+            "远程日期知识暂不可用，当前使用本地规则"
+        case .usingCache:
+            "当前使用最近一次有效的日期知识数据"
+        case .unavailable:
+            "节气与节日数据暂不可用"
+        }
+    }
+}
+
 @MainActor
 protocol DateKnowledgeRepositoryProtocol {
+    var lastLoadState: DateKnowledgeLoadState { get }
     func snapshot(for year: Int) async throws -> DateKnowledgeYearSnapshot
+}
+
+extension DateKnowledgeRepositoryProtocol {
+    var lastLoadState: DateKnowledgeLoadState { .available }
 }
 
 /// Resolves one primary label while keeping every candidate for the detail page.

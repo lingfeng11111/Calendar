@@ -7,6 +7,7 @@ struct DayDetailScreen: View {
 
     @State private var model: DayDetailFeatureModel
     @State private var scheduleEditorItem: ScheduleEditorItem?
+    @State private var isSystemCalendarEventEditorPresented = false
     @State private var pendingScheduleDeletion: ScheduleItem?
     @State private var scheduleOperationError: String?
 
@@ -16,7 +17,8 @@ struct DayDetailScreen: View {
         vacationRepository: (any VacationRepositoryProtocol)? = nil,
         scheduleRepository: (any ScheduleRepositoryProtocol)? = nil,
         dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)? = nil,
-        systemCalendarService: (any SystemCalendarServiceProtocol)? = nil
+        systemCalendarService: (any SystemCalendarServiceProtocol)? = nil,
+        systemCalendarSelectionStore: (any SystemCalendarSelectionStoreProtocol)? = nil
     ) {
         _model = State(
             initialValue: DayDetailFeatureModel(
@@ -25,7 +27,8 @@ struct DayDetailScreen: View {
                 vacationRepository: vacationRepository,
                 scheduleRepository: scheduleRepository,
                 dateKnowledgeRepository: dateKnowledgeRepository,
-                systemCalendarService: systemCalendarService
+                systemCalendarService: systemCalendarService,
+                systemCalendarSelectionStore: systemCalendarSelectionStore
             )
         )
     }
@@ -58,6 +61,7 @@ struct DayDetailScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             await model.load()
+            await model.observeSystemCalendarChanges()
         }
         .refreshable {
             await model.load()
@@ -71,6 +75,17 @@ struct DayDetailScreen: View {
                         pendingScheduleDeletion = schedule
                     }
                 } : nil
+            )
+        }
+        .sheet(
+            isPresented: $isSystemCalendarEventEditorPresented,
+            onDismiss: {
+                Task { await model.loadSystemCalendarEvents() }
+            }
+        ) {
+            SystemCalendarEventEditorSheet(
+                dayID: model.dayID,
+                systemCalendarService: model.systemCalendarService
             )
         }
         .confirmationDialog(
@@ -153,14 +168,31 @@ struct DayDetailScreen: View {
     @ViewBuilder
     private var systemCalendarTimeline: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("系统日历", systemImage: "calendar.badge.checkmark")
-                    .font(.headline)
-                    .foregroundStyle(theme.labelPrimary)
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                    Label("系统日历", systemImage: "calendar.badge.checkmark")
+                        .font(.headline)
+                        .foregroundStyle(theme.labelPrimary)
 
-                Spacer(minLength: 8)
+                    Text(systemCalendarFilterSummary)
+                        .font(.caption)
+                        .foregroundStyle(theme.labelSecondary)
+                    }
 
-                Text(systemCalendarStateTitle)
+                    Spacer(minLength: 8)
+
+                    Button {
+                        isSystemCalendarEventEditorPresented = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(theme.tint)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("新建系统事件")
+                    .accessibilityIdentifier("day.detail.systemCalendar.add")
+
+                    Text(systemCalendarStateTitle)
                     .font(.caption)
                     .foregroundStyle(theme.labelSecondary)
             }
@@ -186,6 +218,14 @@ struct DayDetailScreen: View {
                     ForEach(model.systemCalendarEvents) { event in
                         SystemCalendarTimelineRow(event: event, theme: theme)
                     }
+                }
+            case .filteredOut:
+                systemCalendarMessage(
+                    title: "系统日历来源已隐藏",
+                    message: "请在设置页至少选择一个系统日历来源。",
+                    actionTitle: "打开设置页"
+                ) {
+                    router.navigate(to: .settings)
                 }
             case .permissionRequired:
                 systemCalendarMessage(
@@ -226,6 +266,7 @@ struct DayDetailScreen: View {
         .padding(16)
         .background(cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("day.detail.systemCalendar")
     }
 
@@ -259,7 +300,9 @@ struct DayDetailScreen: View {
         case .loading:
             "读取中"
         case .loaded:
-            model.systemCalendarEvents.isEmpty ? "无事件" : "(model.systemCalendarEvents.count) 项"
+            model.systemCalendarEvents.isEmpty ? "无事件" : "\(model.systemCalendarEvents.count) 项"
+        case .filteredOut:
+            "已隐藏"
         case .permissionRequired:
             "需要授权"
         case .accessDenied:
@@ -271,6 +314,20 @@ struct DayDetailScreen: View {
         case .failed:
             "读取失败"
         }
+    }
+
+    private var systemCalendarFilterSummary: String {
+        guard model.systemCalendarAccess == .fullAccess else {
+            return "只读来源"
+        }
+
+        guard let selectedIDs = model.selectedSystemCalendarIDs else {
+            return "显示全部来源"
+        }
+
+        return selectedIDs.isEmpty
+            ? "未选择来源"
+            : "已选择 \(selectedIDs.count) 个来源"
     }
 
     private func saveSchedule(_ schedule: ScheduleItem) -> String? {
@@ -745,7 +802,7 @@ private struct SystemCalendarTimelineRow: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("(event.title)，(detailText)，来源：(event.sourceTitle ?? event.calendarTitle)")
+        .accessibilityLabel("\(event.title)，\(detailText)，来源：\(event.sourceTitle ?? event.calendarTitle)")
         .accessibilityIdentifier("day.detail.systemCalendar.\(event.id)")
     }
 
@@ -755,16 +812,16 @@ private struct SystemCalendarTimelineRow: View {
             let start = DayID(event.startDate)
             let end = DayID(event.endDate.addingTimeInterval(-1))
             timeText = start == end
-                ? "全天，(start.month)月(start.day)日"
-                : "全天，(start.month)月(start.day)日—(end.month)月(end.day)日"
+                ? "全天，\(start.month)月\(start.day)日"
+                : "全天，\(start.month)月\(start.day)日—\(end.month)月\(end.day)日"
         } else {
             timeText = event.startDate == event.endDate
                 ? event.startDate.formatted(date: .omitted, time: .shortened)
-                : "(event.startDate.formatted(date: .omitted, time: .shortened))—(event.endDate.formatted(date: .omitted, time: .shortened))"
+                : "\(event.startDate.formatted(date: .omitted, time: .shortened))—\(event.endDate.formatted(date: .omitted, time: .shortened))"
         }
 
         if let recurrence = event.recurrenceDescription, !recurrence.isEmpty {
-            return "(timeText)，(recurrence)"
+            return "\(timeText)，\(recurrence)"
         }
         return timeText
     }
@@ -811,6 +868,24 @@ private final class PreviewSystemCalendarService: SystemCalendarServiceProtocol 
     func requestReadAccess() async -> SystemCalendarAccess {
         access
     }
+
+    func requestWriteAccess() async -> SystemCalendarAccess {
+        access
+    }
+
+    func changes() -> AsyncStream<SystemCalendarChange> {
+        AsyncStream { _ in }
+    }
+
+    func calendars() async throws -> [SystemCalendarDescriptor] {
+        []
+    }
+
+    func writableCalendars() async throws -> [SystemCalendarDescriptor] {
+        []
+    }
+
+    func createEvent(_ draft: SystemCalendarEventDraft, calendarID: String) async throws {}
 
     func events(
         in interval: DateInterval,

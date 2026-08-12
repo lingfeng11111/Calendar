@@ -51,7 +51,6 @@ final class HolidaySnapshotModel {
             createdAt: cachedAt,
             updatedAt: cachedAt
         )
-        replaceRecords(with: snapshot)
     }
 
     func replace(with snapshot: HolidayYearSnapshot, cachedAt: Date) {
@@ -62,7 +61,6 @@ final class HolidaySnapshotModel {
         updatedAt = cachedAt
         dataVersion = "1"
         isValid = true
-        replaceRecords(with: snapshot)
     }
 
     func makeDomainSnapshot() throws -> HolidayYearSnapshot {
@@ -78,8 +76,12 @@ final class HolidaySnapshotModel {
         )
     }
 
-    private func replaceRecords(with snapshot: HolidayYearSnapshot) {
-        records = snapshot.records.map { CachedHolidayRecordModel(record: $0) }
-        records.forEach { $0.snapshot = self }
+    func makeRecordModels(from snapshot: HolidayYearSnapshot) -> [CachedHolidayRecordModel] {
+        snapshot.records.map { CachedHolidayRecordModel(record: $0) }
+    }
+
+    func replaceRecords(with newRecords: [CachedHolidayRecordModel]) {
+        records = newRecords
+        newRecords.forEach { $0.snapshot = self }
     }
 }

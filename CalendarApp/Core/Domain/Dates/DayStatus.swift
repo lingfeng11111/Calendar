@@ -7,6 +7,16 @@ enum WorkStatus: Codable, Hashable, Sendable {
     case makeupWorkday
     case unknown
 
+    var displayName: String {
+        switch self {
+        case .workday: "工作日"
+        case .weekend: "周末"
+        case .holiday: "休息日"
+        case .makeupWorkday: "调休补班"
+        case .unknown: "状态待确认"
+        }
+    }
+
     var isOffDay: Bool? {
         switch self {
         case .holiday, .weekend:
