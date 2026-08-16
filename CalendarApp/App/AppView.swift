@@ -48,6 +48,7 @@ struct AppView: View {
                     holidayRepository: dependencies.holidayRepository,
                     vacationRepository: dependencies.vacationRepository,
                     scheduleRepository: dependencies.scheduleRepository,
+                    dateKnowledgeRepository: dependencies.dateKnowledgeRepository,
                     notificationPreferencesStore: dependencies.notificationPreferencesStore
                 ),
                 router: settingsRouter
@@ -112,6 +113,7 @@ struct AppView: View {
                 holidayRepository: dependencies.holidayRepository,
                 vacationRepository: dependencies.vacationRepository,
                 scheduleRepository: dependencies.scheduleRepository,
+                dateKnowledgeRepository: dependencies.dateKnowledgeRepository,
                 notificationPreferencesStore: dependencies.notificationPreferencesStore
             )
         }

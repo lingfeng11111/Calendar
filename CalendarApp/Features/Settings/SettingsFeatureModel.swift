@@ -31,6 +31,7 @@ final class SettingsFeatureModel {
     @ObservationIgnored let holidayRepository: (any HolidayRepositoryProtocol)?
     @ObservationIgnored let vacationRepository: (any VacationRepositoryProtocol)?
     @ObservationIgnored let scheduleRepository: (any ScheduleRepositoryProtocol)?
+    @ObservationIgnored let dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)?
     @ObservationIgnored let systemCalendarService: (any SystemCalendarServiceProtocol)?
     @ObservationIgnored let systemCalendarSelectionStore: (any SystemCalendarSelectionStoreProtocol)?
     @ObservationIgnored let notificationService: (any NotificationServiceProtocol)?
@@ -48,6 +49,10 @@ final class SettingsFeatureModel {
     var notificationPreferences: CalendarNotificationPreferences = .disabled
     var notificationPlanState: SettingsNotificationPlanState = .idle
     var notificationPlanCount = 0
+    var dateKnowledgeState: DateKnowledgeLoadState = .idle
+    var dateKnowledgeDiagnostics: [DateKnowledgeSourceDiagnostic] = []
+    var dateKnowledgeYear = DayID(Date()).year
+    var dateKnowledgeErrorMessage: String?
 
     init(
         systemCalendarService: (any SystemCalendarServiceProtocol)?,
@@ -56,11 +61,13 @@ final class SettingsFeatureModel {
         holidayRepository: (any HolidayRepositoryProtocol)? = nil,
         vacationRepository: (any VacationRepositoryProtocol)? = nil,
         scheduleRepository: (any ScheduleRepositoryProtocol)? = nil,
+        dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)? = nil,
         notificationPreferencesStore: (any NotificationPreferencesStoreProtocol)? = nil
     ) {
         self.holidayRepository = holidayRepository
         self.vacationRepository = vacationRepository
         self.scheduleRepository = scheduleRepository
+        self.dateKnowledgeRepository = dateKnowledgeRepository
         self.systemCalendarService = systemCalendarService
         self.systemCalendarSelectionStore = systemCalendarSelectionStore
         self.notificationService = notificationService
@@ -68,6 +75,38 @@ final class SettingsFeatureModel {
         self.systemCalendarAccess = systemCalendarService?.access ?? .unavailable
         self.notificationAuthorization = notificationService == nil ? .unavailable : .notDetermined
         self.notificationState = notificationService == nil ? .unavailable : .idle
+    }
+
+    func loadDateKnowledgeDiagnostics(referenceDate: Date = Date()) async {
+        guard let dateKnowledgeRepository else {
+            dateKnowledgeState = .unavailable
+            dateKnowledgeDiagnostics = []
+            dateKnowledgeErrorMessage = "日期知识服务尚未准备好"
+            return
+        }
+
+        dateKnowledgeYear = DayID(referenceDate).year
+        dateKnowledgeErrorMessage = nil
+        dateKnowledgeState = .loading
+
+        do {
+            _ = try await dateKnowledgeRepository.snapshot(for: dateKnowledgeYear)
+            dateKnowledgeState = dateKnowledgeRepository.lastLoadState
+            dateKnowledgeDiagnostics = dateKnowledgeRepository.sourceDiagnostics
+            if dateKnowledgeState == .unavailable {
+                dateKnowledgeErrorMessage = "日期知识数据暂不可用"
+            }
+        } catch is CancellationError {
+            dateKnowledgeState = .idle
+        } catch let error as LocalizedError {
+            dateKnowledgeState = .unavailable
+            dateKnowledgeDiagnostics = dateKnowledgeRepository.sourceDiagnostics
+            dateKnowledgeErrorMessage = error.errorDescription ?? "日期知识数据读取失败"
+        } catch {
+            dateKnowledgeState = .unavailable
+            dateKnowledgeDiagnostics = dateKnowledgeRepository.sourceDiagnostics
+            dateKnowledgeErrorMessage = "日期知识数据读取失败"
+        }
     }
 
     func loadNotificationAuthorization() async {

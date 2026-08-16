@@ -1542,6 +1542,42 @@ final class CalendarAppTests: XCTestCase {
         )
     }
 
+    func testOrdinaryFestivalProviderUsesConfiguredEndpointAndSkipsPublicRecords() async throws {
+        URLProtocolStub.requestHandler = { request in
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            let body = """
+            [
+              {"date":"2026-02-14","name":"Valentine's Day","localName":"情人节","holidayTypes":["Observance"]},
+              {"date":"2026-01-01","name":"New Year's Day","holidayTypes":["Public"]}
+            ]
+            """
+            return (response, Data(body.utf8))
+        }
+
+        let baseURL = try XCTUnwrap(URL(string: "https://example.test/api/v4/Holidays"))
+        let provider = OrdinaryFestivalDateKnowledgeProvider(
+            baseURL: baseURL,
+            countryCode: "cn",
+            client: makeStubHTTPClient(),
+            now: { Date(timeIntervalSince1970: 300) }
+        )
+
+        let snapshot = try await provider.fetchYear(2026)
+
+        XCTAssertEqual(snapshot.providerID, "ordinary-festivals-nager-v1")
+        XCTAssertEqual(snapshot.annotations.count, 1)
+        XCTAssertEqual(snapshot.annotations.first?.title, "情人节")
+        XCTAssertEqual(snapshot.annotations.first?.kind, .observance)
+        XCTAssertEqual(URLProtocolStub.lastRequest?.url?.path, "/api/v4/Holidays/CN/2026")
+    }
+
     func testCompositeDateKnowledgeProviderKeepsSuccessfulSources() async throws {
         let solar = SolarTermsAlgorithmProvider()
         let traditional = ChineseTraditionalFestivalProvider()
@@ -1549,9 +1585,31 @@ final class CalendarAppTests: XCTestCase {
 
         let snapshot = try await provider.fetchYear(2026)
 
-        XCTAssertEqual(snapshot.providerID, "date-knowledge-composite-v3-fallback")
+        XCTAssertEqual(snapshot.providerID, "date-knowledge-composite-v4-fallback")
         XCTAssertNotNil(snapshot.annotations.first(where: { $0.title == "小寒" }))
         XCTAssertNotNil(snapshot.annotations.first(where: { $0.title == "春节" }))
+    }
+
+    func testCompositeDateKnowledgeProviderReportsPartialSourceFailures() async throws {
+        let failedObservance = RecordingDateKnowledgeProvider(
+            id: "ordinary-fixture",
+            outcome: .failure(.notAvailable)
+        )
+        let provider = CompositeDateKnowledgeProvider(
+            providers: [failedObservance, SolarTermsAlgorithmProvider()]
+        )
+
+        let result = try await provider.fetchYearWithDiagnostics(2026)
+
+        XCTAssertNotNil(result.snapshot.annotations.first(where: { $0.title == "立秋" }))
+        XCTAssertEqual(
+            result.diagnostics.first(where: { $0.sourceID == "ordinary-fixture" })?.state,
+            .unavailable
+        )
+        XCTAssertEqual(
+            result.diagnostics.first(where: { $0.sourceID == "solar-terms-local-algorithm-v1-v1" })?.state,
+            .available
+        )
     }
 
     func testSolarTermsResilientProviderUsesLocalAlgorithmAfterRemoteFailure() async throws {
@@ -1631,6 +1689,31 @@ final class CalendarAppTests: XCTestCase {
         XCTAssertEqual(staleSnapshot, snapshot)
         let staleRequests = await staleProvider.requestedYearList()
         XCTAssertEqual(staleRequests, [2026])
+    }
+
+    @MainActor
+    func testDateKnowledgeRepositoryPublishesSourceDiagnostics() async throws {
+        let failedObservance = RecordingDateKnowledgeProvider(
+            id: "ordinary-fixture",
+            outcome: .failure(.notAvailable)
+        )
+        let repository = DateKnowledgeRepository(
+            primaryProvider: CompositeDateKnowledgeProvider(
+                providers: [SolarTermsAlgorithmProvider(), failedObservance]
+            ),
+            now: { Date(timeIntervalSince1970: 300) }
+        )
+
+        _ = try await repository.snapshot(for: 2026)
+
+        XCTAssertEqual(repository.lastLoadState, .usingFallback)
+        XCTAssertEqual(
+            repository.sourceDiagnostics.first(where: { $0.sourceID == "ordinary-fixture" })?.state,
+            .unavailable
+        )
+        XCTAssertNotNil(
+            repository.sourceDiagnostics.first(where: { $0.sourceID == "solar-terms-local-algorithm-v1-v1" })
+        )
     }
 
     func testDayCompositionMarksUnpublishedDatesAsUnknown() throws {

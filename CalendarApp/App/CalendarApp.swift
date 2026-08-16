@@ -34,7 +34,8 @@ struct CalendarApp: App {
                 primaryProvider: CompositeDateKnowledgeProvider(
                     providers: [
                         ChineseTraditionalFestivalProvider(),
-                        SolarTermsResilientProvider()
+                        SolarTermsResilientProvider(),
+                        OrdinaryFestivalDateKnowledgeProvider()
                     ]
                 ),
                 fallbackProvider: SolarTermsAlgorithmProvider()

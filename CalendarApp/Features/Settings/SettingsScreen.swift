@@ -11,6 +11,7 @@ struct SettingsScreen: View {
         holidayRepository: (any HolidayRepositoryProtocol)? = nil,
         vacationRepository: (any VacationRepositoryProtocol)? = nil,
         scheduleRepository: (any ScheduleRepositoryProtocol)? = nil,
+        dateKnowledgeRepository: (any DateKnowledgeRepositoryProtocol)? = nil,
         notificationPreferencesStore: (any NotificationPreferencesStoreProtocol)? = nil
     ) {
         _model = State(
@@ -21,16 +22,19 @@ struct SettingsScreen: View {
                 holidayRepository: holidayRepository,
                 vacationRepository: vacationRepository,
                 scheduleRepository: scheduleRepository,
+                dateKnowledgeRepository: dateKnowledgeRepository,
                 notificationPreferencesStore: notificationPreferencesStore
             )
         )
     }
 
     var body: some View {
+        let dateKnowledgeDiagnostics = model.dateKnowledgeDiagnostics
+
         Form {
             Section("项目状态") {
-                LabeledContent("阶段", value: "阶段 7：通知与 Widget")
-                LabeledContent("最低系统", value: "iOS 18")
+                LabeledContent("阶段", value: "阶段 7.5：日期知识来源诊断")
+                LabeledContent("最低系统", value: "iOS 17")
             }
 
             Section("系统日历") {
@@ -206,11 +210,85 @@ struct SettingsScreen: View {
                 .accessibilityIdentifier("settings.notifications.reconcile")
             }
 
+            Section("日期知识来源") {
+                LabeledContent("读取年份", value: "\(model.dateKnowledgeYear)")
+
+                if model.dateKnowledgeState == .loading {
+                    ProgressView("正在读取来源状态")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if dateKnowledgeDiagnostics.isEmpty {
+                    Text(model.dateKnowledgeErrorMessage ?? "尚未读取日期知识来源。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(dateKnowledgeDiagnostics, id: \.id) { (source: DateKnowledgeSourceDiagnostic) in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(source.displayName)
+                                    .font(.body.weight(.medium))
+                                Spacer(minLength: 12)
+                                Text(source.state.displayName)
+                                    .font(.subheadline)
+                                    .foregroundStyle(source.state.isHealthy ? Color.secondary : Color.red)
+                            }
+
+                            Text("\(source.annotationCount) 条日期知识")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if let fetchedAt = source.fetchedAt {
+                                Text("最近获取：\(fetchedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let sourceURL = source.sourceURL {
+                                Text("来源：\(sourceURL.host ?? sourceURL.absoluteString)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let errorDescription = source.errorDescription {
+                                Text(errorDescription)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("settings.dateKnowledge.source.\(source.sourceID)")
+                    }
+                }
+
+                if let dateKnowledgeErrorMessage = model.dateKnowledgeErrorMessage,
+                   !dateKnowledgeDiagnostics.contains(where: { $0.errorDescription == dateKnowledgeErrorMessage }) {
+                    Text(dateKnowledgeErrorMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    Task { await model.loadDateKnowledgeDiagnostics() }
+                } label: {
+                    if model.dateKnowledgeState == .loading {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Text("重新读取日期知识")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.dateKnowledgeState == .loading)
+                .accessibilityIdentifier("settings.dateKnowledge.retry")
+            }
+
             Section("后续能力") {
                 LabeledContent("节假日数据", value: "已接入远程与缓存")
                 LabeledContent("系统事件写入", value: "日期详情支持主动创建")
                 LabeledContent("本地通知", value: "已接入授权与协调边界")
-                LabeledContent("Widget", value: "后续实现")
+                LabeledContent("Widget", value: "已接入，正式签名待复验")
             }
         }
         .navigationTitle("设置")
@@ -219,6 +297,7 @@ struct SettingsScreen: View {
             await model.loadSystemCalendarConfiguration()
             await model.loadNotificationAuthorization()
             model.loadNotificationPreferences()
+            Task { await model.loadDateKnowledgeDiagnostics() }
             await model.observeSystemCalendarChanges()
         }
     }
@@ -238,6 +317,10 @@ struct SettingsScreen: View {
         case .fullAccess:
             "已获得完整读取权限，可选择来源，也可以在日期详情中主动创建系统事件。"
         }
+    }
+
+    private var dateKnowledgeDiagnostics: [DateKnowledgeSourceDiagnostic] {
+        model.dateKnowledgeDiagnostics
     }
 
     private var notificationDescription: String {

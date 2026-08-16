@@ -106,6 +106,21 @@ final class CalendarAppUITests: XCTestCase {
     }
 
     @MainActor
+    func testSettingsShowsDateKnowledgeDiagnosticsEntry() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing-fixture"]
+        app.launch()
+
+        app.tabBars.buttons["设置"].tap()
+
+        let retryButton = app.buttons["settings.dateKnowledge.retry"]
+        for _ in 0..<3 where !retryButton.exists {
+            app.swipeUp()
+        }
+        XCTAssertTrue(retryButton.waitForExistence(timeout: 5))
+    }
+
+    @MainActor
     func testVacationTabShowsPersonalDateList() {
         let app = XCUIApplication()
         app.launchArguments = ["-ui-testing-fixture"]

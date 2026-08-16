@@ -203,6 +203,9 @@ struct CalendarScreen: View {
             }
         }
         .padding(.bottom, model.selectedDayID == model.today ? 0 : 14)
+        // The navigation bar has fixed hit targets and a compact capsule;
+        // keep its dense layout stable when accessibility text is enlarged.
+        .dynamicTypeSize(.large)
     }
 
     private func navigationArrow(
@@ -319,6 +322,9 @@ struct CalendarScreen: View {
                     }
                 }
         )
+        // The year grid is a dense navigation surface. Stable typography
+        // prevents month cards from overlapping at the largest text sizes.
+        .dynamicTypeSize(.large)
         .accessibilityIdentifier("calendar.yearOverview")
     }
 
@@ -416,6 +422,9 @@ struct CalendarScreen: View {
                     }
                 }
         )
+        // A seven-column calendar keeps a stable reading scale so enlarged
+        // text does not change the hit-target geometry or overlap annotations.
+        .dynamicTypeSize(.large)
     }
 
     @ViewBuilder
@@ -862,6 +871,7 @@ private struct WeekdayHeader: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("星期一至星期日")
+        .dynamicTypeSize(.large)
     }
 }
 

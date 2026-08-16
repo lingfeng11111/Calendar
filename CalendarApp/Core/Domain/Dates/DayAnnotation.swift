@@ -164,7 +164,115 @@ enum DateKnowledgeError: Error, Equatable, LocalizedError, Sendable {
 
 protocol DateKnowledgeProvider: Sendable {
     var id: String { get }
+    /// Identifies the kind of knowledge supplied by this provider. The
+    /// default keeps existing fixture providers source-compatible while
+    /// allowing the settings screen to explain each source independently.
+    var sourceKind: DateKnowledgeSourceKind { get }
+    var displayName: String { get }
+    var sourceURL: URL? { get }
     func fetchYear(_ year: Int) async throws -> DateKnowledgeYearSnapshot
+}
+
+extension DateKnowledgeProvider {
+    var sourceKind: DateKnowledgeSourceKind { .observance }
+    var displayName: String { id }
+    var sourceURL: URL? { nil }
+}
+
+enum DateKnowledgeSourceKind: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
+    case solarTerm
+    case traditionalFestival
+    case observance
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .solarTerm:
+            "二十四节气"
+        case .traditionalFestival:
+            "重要传统节日"
+        case .observance:
+            "其他节日与纪念日"
+        }
+    }
+
+    var displayOrder: Int {
+        switch self {
+        case .solarTerm:
+            0
+        case .traditionalFestival:
+            1
+        case .observance:
+            2
+        }
+    }
+}
+
+enum DateKnowledgeSourceState: String, Codable, Equatable, Sendable {
+    case available
+    case usingFallback
+    case usingCache
+    case unavailable
+
+    var displayName: String {
+        switch self {
+        case .available:
+            "已更新"
+        case .usingFallback:
+            "使用备用规则"
+        case .usingCache:
+            "使用缓存"
+        case .unavailable:
+            "暂不可用"
+        }
+    }
+
+    var isHealthy: Bool {
+        self != .unavailable
+    }
+}
+
+struct DateKnowledgeSourceDiagnostic: Codable, Hashable, Identifiable, Sendable {
+    let sourceID: String
+    let kind: DateKnowledgeSourceKind
+    let displayName: String
+    let state: DateKnowledgeSourceState
+    let annotationCount: Int
+    let fetchedAt: Date?
+    let sourceURL: URL?
+    let errorDescription: String?
+
+    var id: String { sourceID }
+
+    init(
+        sourceID: String,
+        kind: DateKnowledgeSourceKind,
+        displayName: String? = nil,
+        state: DateKnowledgeSourceState,
+        annotationCount: Int = 0,
+        fetchedAt: Date? = nil,
+        sourceURL: URL? = nil,
+        errorDescription: String? = nil
+    ) {
+        self.sourceID = sourceID
+        self.kind = kind
+        self.displayName = displayName ?? kind.displayName
+        self.state = state
+        self.annotationCount = max(annotationCount, 0)
+        self.fetchedAt = fetchedAt
+        self.sourceURL = sourceURL
+        self.errorDescription = errorDescription
+    }
+}
+
+struct DateKnowledgeFetchResult: Sendable {
+    let snapshot: DateKnowledgeYearSnapshot
+    let diagnostics: [DateKnowledgeSourceDiagnostic]
+}
+
+protocol DateKnowledgeDiagnosticsProvider: DateKnowledgeProvider {
+    func fetchYearWithDiagnostics(_ year: Int) async throws -> DateKnowledgeFetchResult
 }
 
 enum DateKnowledgeLoadState: Equatable, Sendable {
@@ -194,11 +302,13 @@ enum DateKnowledgeLoadState: Equatable, Sendable {
 @MainActor
 protocol DateKnowledgeRepositoryProtocol {
     var lastLoadState: DateKnowledgeLoadState { get }
+    var sourceDiagnostics: [DateKnowledgeSourceDiagnostic] { get }
     func snapshot(for year: Int) async throws -> DateKnowledgeYearSnapshot
 }
 
 extension DateKnowledgeRepositoryProtocol {
     var lastLoadState: DateKnowledgeLoadState { .available }
+    var sourceDiagnostics: [DateKnowledgeSourceDiagnostic] { [] }
 }
 
 /// Resolves one primary label while keeping every candidate for the detail page.

@@ -17,6 +17,16 @@ private struct SolarTermDTO: Decodable, Sendable {
     }
 }
 
+/// Nager.Date's v4 holiday response is intentionally decoded as a small
+/// compatibility DTO. Optional fields allow a self-hosted or v3-compatible
+/// endpoint to be configured without coupling the domain model to one schema.
+private struct ObservanceDTO: Decodable, Sendable {
+    let date: String
+    let name: String?
+    let localName: String?
+    let holidayTypes: [String]?
+}
+
 private enum SolarTermCatalog {
     static let names = [
         "立春", "雨水", "惊蛰", "春分", "清明", "谷雨",
@@ -38,6 +48,10 @@ struct SolarTermsDateKnowledgeProvider: DateKnowledgeProvider, Sendable {
     let client: HTTPClient
 
     private let now: @Sendable () -> Date
+
+    var sourceKind: DateKnowledgeSourceKind { .solarTerm }
+    var displayName: String { "远程节气 API" }
+    var sourceURL: URL? { baseURL }
 
     init(
         baseURL: URL = Self.defaultBaseURL,
@@ -155,6 +169,9 @@ struct SolarTermsAlgorithmProvider: DateKnowledgeProvider, Sendable {
 
     private let now: @Sendable () -> Date
 
+    var sourceKind: DateKnowledgeSourceKind { .solarTerm }
+    var displayName: String { "节气本地规则" }
+
     private static let rules: [(name: String, month: Int, coefficient: Double)] = [
         // The coefficients are calibrated for the Gregorian year formula;
         // month/day stays a rule-derived result and is never an annual table.
@@ -203,10 +220,14 @@ struct SolarTermsAlgorithmProvider: DateKnowledgeProvider, Sendable {
 
 /// Keeps remote and local solar-term behavior together so a remote outage does
 /// not make the traditional-festival source look like a complete success.
-struct SolarTermsResilientProvider: DateKnowledgeProvider, Sendable {
+struct SolarTermsResilientProvider: DateKnowledgeProvider, DateKnowledgeDiagnosticsProvider, Sendable {
     let id = "solar-terms-resilient-v1"
     private let primary: any DateKnowledgeProvider
     private let fallback: any DateKnowledgeProvider
+
+    var sourceKind: DateKnowledgeSourceKind { .solarTerm }
+    var displayName: String { "节气远程源与本地备用规则" }
+    var sourceURL: URL? { primary.sourceURL }
 
     init(
         primary: any DateKnowledgeProvider = SolarTermsDateKnowledgeProvider(),
@@ -217,12 +238,46 @@ struct SolarTermsResilientProvider: DateKnowledgeProvider, Sendable {
     }
 
     func fetchYear(_ year: Int) async throws -> DateKnowledgeYearSnapshot {
+        try await fetchYearWithDiagnostics(year).snapshot
+    }
+
+    func fetchYearWithDiagnostics(_ year: Int) async throws -> DateKnowledgeFetchResult {
         do {
-            return try await primary.fetchYear(year)
+            return try await fetchDateKnowledgeResult(from: primary, year: year)
         } catch is CancellationError {
             throw CancellationError()
-        } catch {
-            return try await fallback.fetchYear(year)
+        } catch let primaryError {
+            do {
+                let fallbackResult = try await fetchDateKnowledgeResult(from: fallback, year: year)
+                let fallbackDiagnostics = fallbackResult.diagnostics.map { diagnostic in
+                    DateKnowledgeSourceDiagnostic(
+                        sourceID: diagnostic.sourceID,
+                        kind: diagnostic.kind,
+                        displayName: diagnostic.displayName,
+                        state: .usingFallback,
+                        annotationCount: diagnostic.annotationCount,
+                        fetchedAt: diagnostic.fetchedAt,
+                        sourceURL: diagnostic.sourceURL,
+                        errorDescription: diagnostic.errorDescription
+                    )
+                }
+                let primaryDiagnostic = DateKnowledgeSourceDiagnostic(
+                    sourceID: primary.id,
+                    kind: primary.sourceKind,
+                    displayName: primary.displayName,
+                    state: .unavailable,
+                    sourceURL: primary.sourceURL,
+                    errorDescription: primaryError.localizedDescription
+                )
+                return DateKnowledgeFetchResult(
+                    snapshot: fallbackResult.snapshot,
+                    diagnostics: [primaryDiagnostic] + fallbackDiagnostics
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw DateKnowledgeError.notAvailable
+            }
         }
     }
 }
@@ -232,6 +287,9 @@ struct SolarTermsResilientProvider: DateKnowledgeProvider, Sendable {
 /// a year-by-year table.
 struct ChineseTraditionalFestivalProvider: DateKnowledgeProvider, Sendable {
     let id = "traditional-festivals-chinese-calendar-v1"
+
+    var sourceKind: DateKnowledgeSourceKind { .traditionalFestival }
+    var displayName: String { "中国传统节日规则" }
 
     private let now: @Sendable () -> Date
 
@@ -314,14 +372,132 @@ struct ChineseTraditionalFestivalProvider: DateKnowledgeProvider, Sendable {
     }
 }
 
+/// Reads lower-priority observances from a replaceable holiday endpoint.
+///
+/// The default endpoint is Nager.Date v4, but both the endpoint and country
+/// code are injectable so a future regional source can replace it without
+/// changing the calendar domain. Public and bank holidays are left to the
+/// official holiday provider; this provider keeps only Optional/Observance
+/// records to avoid taking over the calendar's priority ordering.
+struct OrdinaryFestivalDateKnowledgeProvider: DateKnowledgeProvider, Sendable {
+    static let defaultBaseURL = URL(string: "https://date.nager.at/api/v4/Holidays")!
+
+    let id: String
+    let baseURL: URL
+    let countryCode: String
+    let client: HTTPClient
+
+    private let now: @Sendable () -> Date
+
+    var sourceKind: DateKnowledgeSourceKind { .observance }
+    var displayName: String { "其他节日 API" }
+    var sourceURL: URL? { baseURL }
+
+    init(
+        baseURL: URL = Self.defaultBaseURL,
+        countryCode: String = "CN",
+        client: HTTPClient = HTTPClient(timeoutInterval: 3),
+        id: String = "ordinary-festivals-nager-v1",
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.baseURL = baseURL
+        self.countryCode = countryCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        self.client = client
+        self.id = id
+        self.now = now
+    }
+
+    func fetchYear(_ year: Int) async throws -> DateKnowledgeYearSnapshot {
+        guard (1...9999).contains(year) else {
+            throw DateKnowledgeError.invalidYear(year)
+        }
+        guard baseURL.scheme != nil, baseURL.host != nil, !countryCode.isEmpty else {
+            throw DateKnowledgeError.invalidResponse
+        }
+
+        do {
+            let response = try await client.get(
+                [ObservanceDTO].self,
+                from: endpoint(for: year)
+            )
+            let annotations = try response.compactMap { record -> DayAnnotation? in
+                guard record.isOrdinaryObservance else {
+                    return nil
+                }
+                guard let dayID = Self.makeDayID(from: record.date), dayID.year == year else {
+                    throw DateKnowledgeError.invalidDate(record.date)
+                }
+                let title = (record.localName ?? record.name ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty else {
+                    return nil
+                }
+                return DayAnnotation(
+                    dayID: dayID,
+                    title: title,
+                    kind: .observance,
+                    sourceID: id,
+                    sourceURL: baseURL
+                )
+            }
+
+            return try DateKnowledgeYearSnapshot(
+                year: year,
+                providerID: id,
+                fetchedAt: now(),
+                sourceURL: baseURL,
+                annotations: annotations
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DateKnowledgeError {
+            throw error
+        } catch let error as HTTPClientError {
+            if case .cancelled = error {
+                throw CancellationError()
+            }
+            throw DateKnowledgeError.notAvailable
+        } catch {
+            throw DateKnowledgeError.notAvailable
+        }
+    }
+
+    func endpoint(for year: Int) -> URL {
+        baseURL
+            .appendingPathComponent(countryCode)
+            .appendingPathComponent(String(year))
+    }
+
+    private static func makeDayID(from value: String) -> DayID? {
+        let parts = value.split(separator: "-")
+        guard parts.count >= 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2]) else {
+            return nil
+        }
+        return DayID(year: year, month: month, day: day)
+    }
+}
+
+private extension ObservanceDTO {
+    var isOrdinaryObservance: Bool {
+        guard let holidayTypes else {
+            return true
+        }
+        let normalizedTypes = holidayTypes.map { $0.lowercased() }
+        return normalizedTypes.contains("observance") || normalizedTypes.contains("optional")
+    }
+}
+
 /// Merges independently replaceable sources. One failing source does not
 /// erase the successful sources, which keeps the calendar useful offline.
-struct CompositeDateKnowledgeProvider: DateKnowledgeProvider, Sendable {
+struct CompositeDateKnowledgeProvider: DateKnowledgeProvider, DateKnowledgeDiagnosticsProvider, Sendable {
     let id: String
     let providers: [any DateKnowledgeProvider]
 
     init(
-        id: String = "date-knowledge-composite-v3",
+        id: String = "date-knowledge-composite-v4",
         providers: [any DateKnowledgeProvider]
     ) {
         self.id = id
@@ -329,13 +505,30 @@ struct CompositeDateKnowledgeProvider: DateKnowledgeProvider, Sendable {
     }
 
     func fetchYear(_ year: Int) async throws -> DateKnowledgeYearSnapshot {
+        try await fetchYearWithDiagnostics(year).snapshot
+    }
+
+    func fetchYearWithDiagnostics(_ year: Int) async throws -> DateKnowledgeFetchResult {
         var snapshots: [DateKnowledgeYearSnapshot] = []
+        var diagnostics: [DateKnowledgeSourceDiagnostic] = []
         for provider in providers {
             do {
-                snapshots.append(try await provider.fetchYear(year))
+                let result = try await fetchDateKnowledgeResult(from: provider, year: year)
+                snapshots.append(result.snapshot)
+                diagnostics.append(contentsOf: result.diagnostics)
             } catch is CancellationError {
                 throw CancellationError()
-            } catch {
+            } catch let error {
+                diagnostics.append(
+                    DateKnowledgeSourceDiagnostic(
+                        sourceID: provider.id,
+                        kind: provider.sourceKind,
+                        displayName: provider.displayName,
+                        state: .unavailable,
+                        sourceURL: provider.sourceURL,
+                        errorDescription: error.localizedDescription
+                    )
+                )
                 continue
             }
         }
@@ -353,12 +546,72 @@ struct CompositeDateKnowledgeProvider: DateKnowledgeProvider, Sendable {
         let usesSolarTermFallback = snapshots.contains {
             $0.annotations.contains { $0.sourceID.hasPrefix("solar-terms-local-algorithm") }
         }
-        return try DateKnowledgeYearSnapshot(
+        let snapshot = try DateKnowledgeYearSnapshot(
             year: year,
             providerID: usesSolarTermFallback ? "\(id)-fallback" : id,
             fetchedAt: snapshots.map(\.fetchedAt).max() ?? Date(),
             annotations: Array(unique.values)
         )
+        return DateKnowledgeFetchResult(
+            snapshot: snapshot,
+            diagnostics: diagnostics.uniquedBySourceID()
+        )
+    }
+}
+
+private func fetchDateKnowledgeResult(
+    from provider: any DateKnowledgeProvider,
+    year: Int
+) async throws -> DateKnowledgeFetchResult {
+    if let diagnosingProvider = provider as? any DateKnowledgeDiagnosticsProvider {
+        return try await diagnosingProvider.fetchYearWithDiagnostics(year)
+    }
+
+    let snapshot = try await provider.fetchYear(year)
+    guard !snapshot.annotations.isEmpty else {
+        return DateKnowledgeFetchResult(
+            snapshot: snapshot,
+            diagnostics: [
+                DateKnowledgeSourceDiagnostic(
+                    sourceID: provider.id,
+                    kind: provider.sourceKind,
+                    displayName: provider.displayName,
+                    state: .available,
+                    fetchedAt: snapshot.fetchedAt,
+                    sourceURL: snapshot.sourceURL ?? provider.sourceURL
+                )
+            ]
+        )
+    }
+    let grouped = Dictionary(grouping: snapshot.annotations, by: \.sourceID)
+    let diagnostics = grouped.map { sourceID, annotations in
+        DateKnowledgeSourceDiagnostic(
+            sourceID: sourceID,
+            kind: annotations.first?.kind == .solarTerm
+                ? .solarTerm
+                : annotations.first?.kind == .importantTraditionalFestival
+                    ? .traditionalFestival
+                    : .observance,
+            displayName: provider.displayName,
+            state: .available,
+            annotationCount: annotations.count,
+            fetchedAt: snapshot.fetchedAt,
+            sourceURL: annotations.first?.sourceURL ?? provider.sourceURL
+        )
+    }
+    return DateKnowledgeFetchResult(snapshot: snapshot, diagnostics: diagnostics)
+}
+
+private extension Array where Element == DateKnowledgeSourceDiagnostic {
+    func uniquedBySourceID() -> [DateKnowledgeSourceDiagnostic] {
+        var seen = Set<String>()
+        return filter { seen.insert($0.sourceID).inserted }
+            .sorted {
+                if $0.kind.displayOrder != $1.kind.displayOrder {
+                    return $0.kind.displayOrder < $1.kind.displayOrder
+                }
+                return $0.sourceID < $1.sourceID
+            }
     }
 }
 
@@ -376,6 +629,7 @@ final class DateKnowledgeRepository: DateKnowledgeRepositoryProtocol {
     private let now: @Sendable () -> Date
 
     private(set) var lastLoadState: DateKnowledgeLoadState = .idle
+    private(set) var sourceDiagnostics: [DateKnowledgeSourceDiagnostic] = []
 
     init(
         modelContext: ModelContext? = nil,
@@ -409,6 +663,7 @@ final class DateKnowledgeRepository: DateKnowledgeRepositoryProtocol {
             compatibleProviderIDs: cacheProviderIDs
         ),
            now().timeIntervalSince(cached.cachedAt) < cacheMaxAge {
+            sourceDiagnostics = diagnostics(for: cached.snapshot, state: .usingCache)
             lastLoadState = cached.snapshot.providerID.hasSuffix("-fallback")
                 ? .usingFallback
                 : .usingCache
@@ -416,21 +671,34 @@ final class DateKnowledgeRepository: DateKnowledgeRepositoryProtocol {
         }
 
         do {
-            let snapshot = try await primaryProvider.fetchYear(year)
-            try save(snapshot)
-            lastLoadState = snapshot.providerID.hasSuffix("-fallback")
+            let result = try await fetchDateKnowledgeResult(from: primaryProvider, year: year)
+            try save(result.snapshot)
+            sourceDiagnostics = result.diagnostics.uniquedBySourceID()
+            lastLoadState = result.snapshot.providerID.hasSuffix("-fallback")
                 ? .usingFallback
                 : .available
-            return snapshot
+            return result.snapshot
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             if let fallbackProvider {
                 do {
-                    let snapshot = try await fallbackProvider.fetchYear(year)
-                    try save(snapshot)
+                    let result = try await fetchDateKnowledgeResult(from: fallbackProvider, year: year)
+                    try save(result.snapshot)
+                    sourceDiagnostics = result.diagnostics.map { diagnostic in
+                        DateKnowledgeSourceDiagnostic(
+                            sourceID: diagnostic.sourceID,
+                            kind: diagnostic.kind,
+                            displayName: diagnostic.displayName,
+                            state: .usingFallback,
+                            annotationCount: diagnostic.annotationCount,
+                            fetchedAt: diagnostic.fetchedAt,
+                            sourceURL: diagnostic.sourceURL,
+                            errorDescription: diagnostic.errorDescription
+                        )
+                    }.uniquedBySourceID()
                     lastLoadState = .usingFallback
-                    return snapshot
+                    return result.snapshot
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -443,14 +711,47 @@ final class DateKnowledgeRepository: DateKnowledgeRepositoryProtocol {
                 for: year,
                 compatibleProviderIDs: cacheProviderIDs
             ) {
+                sourceDiagnostics = diagnostics(for: cached.snapshot, state: .usingCache)
                 lastLoadState = cached.snapshot.providerID.hasSuffix("-fallback")
                     ? .usingFallback
                     : .usingCache
                 return cached.snapshot
             }
+            sourceDiagnostics = [
+                DateKnowledgeSourceDiagnostic(
+                    sourceID: primaryProvider.id,
+                    kind: primaryProvider.sourceKind,
+                    displayName: primaryProvider.displayName,
+                    state: .unavailable,
+                    sourceURL: primaryProvider.sourceURL,
+                    errorDescription: DateKnowledgeError.notAvailable.errorDescription
+                )
+            ]
             lastLoadState = .unavailable
             throw DateKnowledgeError.notAvailable
         }
+    }
+
+    private func diagnostics(
+        for snapshot: DateKnowledgeYearSnapshot,
+        state: DateKnowledgeSourceState
+    ) -> [DateKnowledgeSourceDiagnostic] {
+        Dictionary(grouping: snapshot.annotations, by: \.sourceID)
+            .map { sourceID, annotations in
+                DateKnowledgeSourceDiagnostic(
+                    sourceID: sourceID,
+                    kind: annotations.first?.kind == .solarTerm
+                        ? .solarTerm
+                        : annotations.first?.kind == .importantTraditionalFestival
+                            ? .traditionalFestival
+                            : .observance,
+                    state: state,
+                    annotationCount: annotations.count,
+                    fetchedAt: snapshot.fetchedAt,
+                    sourceURL: annotations.first?.sourceURL ?? snapshot.sourceURL
+                )
+            }
+            .uniquedBySourceID()
     }
 
     private func cachedSnapshot(
